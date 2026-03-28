@@ -1,0 +1,7 @@
+node_modules/
+.env
+.npm-cache/
+config.yaml
+.vscode/
+.test-dist/
+dist/
