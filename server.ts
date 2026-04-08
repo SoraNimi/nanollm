@@ -2,7 +2,9 @@
 import "dotenv/config";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import express from "express";
+import { Hono } from "hono";
+import { serve } from "@hono/node-server";
+import { cors } from "hono/cors";
 import type { ModelConfig } from "./src/config.js";
 import { loadConfig, resolveFallbackModels, resolveModel } from "./src/config.js";
 import { getUpstreamURL } from "./src/proxy.js";
@@ -56,21 +58,37 @@ function resolveConfigPath(argv: string[]): string {
 
 const configPath = resolveConfigPath(process.argv.slice(2));
 const config = loadConfig(configPath);
-const app = express();
+const app = new Hono();
 
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", req.get("access-control-request-headers") ?? "Content-Type,Authorization");
+app.use("*", async (c, next) => {
+  const requestId = createRequestId();
+  const started = Date.now();
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
+  await runWithRequestId(requestId, async () => {
+    console.log(withRequestId(`[HTTP START] method=${c.req.method} path=${c.req.path}`));
 
-  next();
+    try {
+      await next();
+      const responseType = c.res.headers.get("content-type") ?? "";
+      if (responseType.includes("text/event-stream")) {
+        console.log(withRequestId(`[HTTP STREAM START] method=${c.req.method} path=${c.req.path} status=${c.res.status} duration=${Date.now() - started}ms`));
+      } else {
+        console.log(withRequestId(`[HTTP END] method=${c.req.method} path=${c.req.path} status=${c.res.status} duration=${Date.now() - started}ms`));
+      }
+    } catch (error) {
+      console.error(orange(withRequestId(`[HTTP ERROR] method=${c.req.method} path=${c.req.path} duration=${Date.now() - started}ms`)), error);
+      throw error;
+    }
+  });
 });
 
-app.use(express.json({ limit: "10mb" }));
+app.use(
+  cors({
+    origin: "*",
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization"],
+  }),
+);
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -105,12 +123,12 @@ function getDenormalizer(format: StreamFormat): Denormalizer {
   }
 }
 
-function extractModel(body: unknown, format: StreamFormat): string | undefined {
+function extractModel(body: unknown): string | undefined {
   const b = body as Record<string, unknown>;
   return (b.model as string) ?? undefined;
 }
 
-function isStreamRequest(body: unknown, format: StreamFormat): boolean {
+function isStreamRequest(body: unknown): boolean {
   const b = body as Record<string, unknown>;
   return b.stream === true;
 }
@@ -198,204 +216,6 @@ const HOP_BY_HOP_HEADERS = new Set([
   "content-length",
 ]);
 
-function applyUpstreamResponseHeaders(res: express.Response, headers: Headers) {
-  for (const [key, value] of headers.entries()) {
-    if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue;
-    res.setHeader(key, value);
-  }
-}
-
-// ─── Route Factory ──────────────────────────────────────────────────────────
-
-function createRoute(incomingFormat: StreamFormat) {
-  return async (req: express.Request, res: express.Response) => {
-    const requestId = createRequestId();
-    return runWithRequestId(requestId, async () => {
-      const upstreamOptions = { userAgent: req.get("user-agent") ?? undefined };
-      const modelName = extractModel(req.body, incomingFormat);
-      if (!modelName) {
-        return res.status(400).json({ error: "Missing 'model' in request body" });
-      }
-
-      const requestedModel = resolveModel(config, modelName);
-      if (!requestedModel) {
-        return res.status(404).json({
-          error: `Model '${modelName}' not found in config`,
-          available: config.models.map((m) => m.name),
-        });
-      }
-      const stream = isStreamRequest(req.body, incomingFormat);
-
-      // Resolve item_reference for Responses API requests
-      if (incomingFormat === "openai-responses" && Array.isArray(req.body.input)) {
-        req.body.input = resolveItemReferences(req.body.input);
-      }
-
-      const candidateModels = getCandidateModels(modelName);
-      let lastError: (Error & { status?: number; upstream?: string; cause?: unknown }) | undefined;
-
-      try {
-        for (const modelConfig of candidateModels) {
-          console.log(
-            withRequestId(
-              `[REQUEST] model=${modelName} path=${req.path} target=${getUpstreamURL(modelConfig)} candidate=${modelConfig.name}`,
-            ),
-          );
-
-          try {
-            const result = await executeModelRequest(modelConfig, incomingFormat, req.body, stream, upstreamOptions);
-
-            if (result.kind === "stream") {
-              const { body, upstreamFormat } = result;
-
-              if (upstreamFormat === incomingFormat && "headers" in result) {
-                applyUpstreamResponseHeaders(res, result.headers);
-              }
-
-              res.setHeader("Content-Type", res.getHeader("Content-Type") ?? "text/event-stream");
-              res.setHeader("Cache-Control", res.getHeader("Cache-Control") ?? "no-cache");
-              res.setHeader("Connection", "keep-alive");
-              res.setHeader("X-Accel-Buffering", "no");
-              res.flushHeaders();
-              res.socket?.setNoDelay(true);
-
-              if (incomingFormat === "openai-responses") {
-                await pipeStreamAndCache(body, res, upstreamFormat !== incomingFormat ? createSSEConverter(upstreamFormat, incomingFormat) : undefined);
-              } else if (upstreamFormat === incomingFormat) {
-                await pipeStreamAndCache(body, res);
-              } else {
-                const converter = createSSEConverter(upstreamFormat, incomingFormat);
-                const reader = body.getReader();
-                const decoder = new TextDecoder();
-                try {
-                  while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    for (const chunk of converter.push(decoder.decode(value, { stream: true }))) {
-                      writeStreamChunk(res, chunk);
-                    }
-                  }
-                  for (const chunk of converter.flush()) {
-                    writeStreamChunk(res, chunk);
-                  }
-                } finally {
-                  reader.releaseLock();
-                  res.end();
-                }
-              }
-              return;
-            }
-
-            cacheResponseItems((result.json as any)?.output);
-            res.json(result.json);
-            return;
-          } catch (error) {
-            const err = error as Error & { status?: number; upstream?: string; cause?: unknown };
-            recordModelFailure(modelConfig.name);
-            lastError = err;
-            console.warn(
-              orange(
-                withRequestId(
-                  `[MODEL FAILED] requested=${modelName} candidate=${modelConfig.name} path=${req.path} target=${getUpstreamURL(modelConfig)} message=${err.message}`,
-                ),
-              ),
-            );
-            if (res.headersSent) {
-              console.error(orange(withRequestId(`[stream error] ${err.message}`)), err.cause ?? "");
-              if (!res.writableEnded) res.end();
-              return;
-            }
-            if (modelConfig.name !== candidateModels.at(-1)?.name) {
-              console.warn(orange(withRequestId(`[FALLBACK] ${modelConfig.name} failed, trying next candidate`)));
-            }
-          }
-        }
-      } catch (error) {
-        lastError = error as Error & { status?: number; upstream?: string; cause?: unknown };
-      }
-
-      if (lastError) {
-        console.error(orange(withRequestId(`[proxy error] ${lastError.message}`)), lastError.cause ?? "");
-        const status = lastError.status || 500;
-        return res.status(status).json({
-          error: lastError.message || "Request failed",
-          ...(lastError.upstream ? { upstream: tryParseJSON(lastError.upstream) } : {}),
-        });
-      }
-
-      return res.status(500).json({ error: "Request failed" });
-    });
-  };
-}
-
-/**
- * Pipe upstream SSE stream to response.
- * Optionally convert format via SSEConverter.
- * Caches output items from response.output_item.done events for item_reference resolution.
- */
-async function pipeStreamAndCache(
-  body: ReadableStream<Uint8Array>,
-  res: express.Response,
-  converter?: ReturnType<typeof createSSEConverter>,
-) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  const collector = new SSEParser();
-  const outputItems: unknown[] = [];
-
-  function collectItems(sseText: string) {
-    for (const { data } of collector.push(sseText)) {
-      try {
-        const event = JSON.parse(data);
-        // if (converter) {
-        //   console.log('[CONVERTED EVENT]', JSON.stringify(event));
-        // }
-        if (event.type === "response.output_item.done" && event.item) {
-          outputItems.push(event.item);
-        }
-      } catch {}
-    }
-  }
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const text = decoder.decode(value, { stream: true });
-
-      if (converter) {
-        // console.log('[UPSTREAM CHUNK]', text);
-        for (const chunk of converter.push(text)) {
-          collectItems(chunk);
-          writeStreamChunk(res, chunk);
-        }
-      } else {
-        collectItems(text);
-        writeStreamChunk(res, text);
-      }
-    }
-    if (converter) {
-      for (const chunk of converter.flush()) {
-        collectItems(chunk);
-        writeStreamChunk(res, chunk);
-      }
-    }
-    // Flush SSE parser for any remaining buffered events
-    for (const { data } of collector.flush()) {
-      try {
-        const event = JSON.parse(data);
-        if (event.type === "response.output_item.done" && event.item) {
-          outputItems.push(event.item);
-        }
-      } catch {}
-    }
-  } finally {
-    reader.releaseLock();
-    cacheResponseItems(outputItems);
-    res.end();
-  }
-}
-
 function tryParseJSON(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -404,15 +224,237 @@ function tryParseJSON(text: string): unknown {
   }
 }
 
-function writeStreamChunk(res: express.Response, chunk: string | Uint8Array) {
-  res.write(chunk);
-  res.flush?.();
+// ─── Route Factory ──────────────────────────────────────────────────────────
+
+function createRoute(incomingFormat: StreamFormat) {
+  return async (c) => {
+    const userAgent = c.req.header("user-agent");
+    const upstreamOptions = { userAgent };
+    const rawBody = await c.req.json();
+    const modelName = extractModel(rawBody);
+
+    if (!modelName) {
+      return c.json({ error: "Missing 'model' in request body" }, 400);
+    }
+
+    const requestedModel = resolveModel(config, modelName);
+    if (!requestedModel) {
+      return c.json(
+        { error: `Model '${modelName}' not found in config`, available: config.models.map((m) => m.name) },
+        404,
+      );
+    }
+
+    const stream = isStreamRequest(rawBody);
+
+    // Resolve item_reference for Responses API requests
+    if (incomingFormat === "openai-responses" && Array.isArray(rawBody.input)) {
+      rawBody.input = resolveItemReferences(rawBody.input);
+    }
+
+    const candidateModels = getCandidateModels(modelName);
+    let lastError: (Error & { status?: number; upstream?: string; cause?: unknown }) | undefined;
+
+    try {
+      for (const modelConfig of candidateModels) {
+        console.log(
+          withRequestId(
+            `[REQUEST] model=${modelName} path=${c.req.path} target=${getUpstreamURL(modelConfig)} candidate=${modelConfig.name}`,
+          ),
+        );
+
+        try {
+          const result = await executeModelRequest(modelConfig, incomingFormat, rawBody, stream, upstreamOptions);
+
+          if (result.kind === "stream") {
+            const { body, upstreamFormat } = result;
+
+            const responseHeaders: Record<string, string> = {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              "Connection": "keep-alive",
+              "X-Accel-Buffering": "no",
+            };
+
+            if (upstreamFormat === incomingFormat && "headers" in result) {
+              for (const [key, value] of result.headers.entries()) {
+                if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
+                  responseHeaders[key] = value;
+                }
+              }
+            }
+
+            const readable = buildStreamReadable(body, incomingFormat, upstreamFormat, c.req.path);
+
+            return new Response(readable, { headers: responseHeaders });
+          }
+
+          cacheResponseItems((result.json as any)?.output);
+          return c.json(result.json);
+        } catch (error) {
+          const err = error as Error & { status?: number; upstream?: string; cause?: unknown };
+          recordModelFailure(modelConfig.name);
+          lastError = err;
+          console.warn(
+            orange(
+              withRequestId(
+                `[MODEL FAILED] requested=${modelName} candidate=${modelConfig.name} path=${c.req.path} target=${getUpstreamURL(modelConfig)} message=${err.message}`,
+              ),
+            ),
+          );
+          if (modelConfig.name !== candidateModels.at(-1)?.name) {
+            console.warn(orange(withRequestId(`[FALLBACK] ${modelConfig.name} failed, trying next candidate`)));
+          }
+        }
+      }
+    } catch (error) {
+      lastError = error as Error & { status?: number; upstream?: string; cause?: unknown };
+    }
+
+    if (lastError) {
+      console.error(orange(withRequestId(`[proxy error] ${lastError.message}`)), lastError.cause ?? "");
+      const status = lastError.status || 500;
+      return c.json(
+        { error: lastError.message || "Request failed", ...(lastError.upstream ? { upstream: tryParseJSON(lastError.upstream) } : {}) },
+        status,
+      );
+    }
+
+    return c.json({ error: "Request failed" }, 500);
+  };
+}
+
+function buildStreamReadable(
+  body: ReadableStream<Uint8Array>,
+  incomingFormat: StreamFormat,
+  upstreamFormat: StreamFormat,
+  path: string,
+): ReadableStream<Uint8Array> {
+  if (incomingFormat === "openai-responses") {
+    return buildPipeStreamAndCache(body, path, upstreamFormat !== incomingFormat ? createSSEConverter(upstreamFormat, incomingFormat) : undefined);
+  }
+
+  if (upstreamFormat === incomingFormat) {
+    return buildPipeStreamAndCache(body, path);
+  }
+
+  // Convert stream format
+  const converter = createSSEConverter(upstreamFormat, incomingFormat);
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const started = Date.now();
+
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            for (const chunk of converter.flush()) {
+              controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
+            }
+            console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms`));
+            controller.close();
+            return;
+          }
+
+          for (const chunk of converter.push(decoder.decode(value, { stream: true }))) {
+            controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
+          }
+        }
+      } catch (error) {
+        console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
+        controller.error(error);
+      }
+    },
+    cancel() {
+      console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`));
+      reader.releaseLock();
+    },
+  });
+}
+
+/**
+ * Pipe upstream SSE stream, optionally converting format.
+ * Caches output items from response.output_item.done events.
+ */
+function buildPipeStreamAndCache(
+  body: ReadableStream<Uint8Array>,
+  path: string,
+  converter?: ReturnType<typeof createSSEConverter>,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const collector = new SSEParser();
+  const outputItems: unknown[] = [];
+  const encoder = new TextEncoder();
+  const started = Date.now();
+
+  function collectItems(sseText: string) {
+    for (const { data } of collector.push(sseText)) {
+      try {
+        const event = JSON.parse(data);
+        if (event.type === "response.output_item.done" && event.item) {
+          outputItems.push(event.item);
+        }
+      } catch {}
+    }
+  }
+
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            if (converter) {
+              for (const chunk of converter.flush()) {
+                collectItems(typeof chunk === "string" ? chunk : decoder.decode(chunk));
+                controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
+              }
+            }
+            for (const { data } of collector.flush()) {
+              try {
+                const event = JSON.parse(data);
+                if (event.type === "response.output_item.done" && event.item) {
+                  outputItems.push(event.item);
+                }
+              } catch {}
+            }
+            cacheResponseItems(outputItems);
+            console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms`));
+            controller.close();
+            return;
+          }
+
+          const text = decoder.decode(value, { stream: true });
+          if (converter) {
+            for (const chunk of converter.push(text)) {
+              collectItems(typeof chunk === "string" ? chunk : decoder.decode(chunk));
+              controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
+            }
+          } else {
+            collectItems(text);
+            controller.enqueue(value);
+          }
+        }
+      } catch (error) {
+        console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
+        controller.error(error);
+      }
+    },
+    cancel() {
+      console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`));
+      reader.releaseLock();
+    },
+  });
 }
 
 // ─── Routes ─────────────────────────────────────────────────────────────────
 
-app.get("/", (_req, res) => {
-  res.json({
+app.get("/", (c) => {
+  return c.json({
     ok: true,
     message: "nanollm gateway",
     models: config.models.map((m) => ({ name: m.name, provider: m.provider, model: m.model })),
@@ -425,12 +467,10 @@ app.get("/", (_req, res) => {
   });
 });
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
-});
+app.get("/health", (c) => c.json({ ok: true }));
 
-app.get("/v1/models", (_req, res) => {
-  res.json({
+app.get("/v1/models", (c) => {
+  return c.json({
     object: "list",
     data: config.models.map((m) => ({
       id: m.name,
@@ -446,10 +486,8 @@ app.post("/v1/messages", createRoute("anthropic"));
 
 // ─── Start ──────────────────────────────────────────────────────────────────
 
-const server = app.listen(config.port);
-
-server.once("listening", () => {
-  console.log(`nanollm gateway listening on http://localhost:${config.port}`);
+const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
+  console.log(`nanollm gateway listening on http://localhost:${info.port}`);
   console.log(`Models: ${config.models.map((m) => m.name).join(", ") || "(none)"}`);
   console.log(
     `Fallback groups: ${

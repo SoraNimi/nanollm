@@ -1,7 +1,7 @@
 {
   "name": "nanollm",
-  "version": "0.0.3",
-  "description": "Express server that proxies llm request",
+  "version": "0.0.4",
+  "description": "Hono server that proxies llm request",
   "main": "./dist/server.js",
   "bin": {
     "nanollm": "dist/cli.js"
@@ -22,7 +22,7 @@
   "keywords": [
     "llm",
     "proxy",
-    "express",
+    "hono",
     "litellm"
   ],
   "author": "sunwu51",
@@ -30,15 +30,15 @@
   "type": "module",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",
+    "@hono/node-server": "^1.19.13",
     "dotenv": "^17.3.1",
-    "express": "^5.2.1",
+    "hono": "^4.12.12",
     "https-proxy-agent": "^8.0.0",
     "openai": "^6.32.0",
     "undici": "^7.24.5",
     "yaml": "^2.8.3"
   },
   "devDependencies": {
-    "@types/express": "^5.0.6",
     "@types/node": "^25.5.0",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
