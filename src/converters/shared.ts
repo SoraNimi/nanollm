@@ -88,6 +88,7 @@ export interface NormalizedRequest {
 
 export interface NormalizedUsage {
   inputTokens?: number;
+  nonCacheInputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
   reasoningTokens?: number;
@@ -179,9 +180,8 @@ export function normalizeReasoningEffortFromBudget(thinkingBudgetTokens: number 
 export function normalizeUsage(usage: Record<string, unknown> | null | undefined): NormalizedUsage | undefined {
   if (!usage) return undefined;
 
-  const inputTokens = asNumber(usage.input_tokens) ?? asNumber(usage.prompt_tokens);
+  const providerInputTokens = asNumber(usage.input_tokens) ?? asNumber(usage.prompt_tokens);
   const outputTokens = asNumber(usage.output_tokens) ?? asNumber(usage.completion_tokens);
-  const totalTokens = asNumber(usage.total_tokens) ?? (inputTokens != null || outputTokens != null ? (inputTokens ?? 0) + (outputTokens ?? 0) : undefined);
   const reasoningTokens =
     asNumber((usage.completion_tokens_details as Record<string, unknown> | undefined)?.reasoning_tokens) ??
     asNumber((usage.output_tokens_details as Record<string, unknown> | undefined)?.reasoning_tokens);
@@ -191,9 +191,22 @@ export function normalizeUsage(usage: Record<string, unknown> | null | undefined
     asNumber(usage.prompt_cache_hit_tokens) ??
     asNumber((usage.prompt_tokens_details as Record<string, unknown> | undefined)?.cached_tokens) ??
     asNumber((usage.input_tokens_details as Record<string, unknown> | undefined)?.cached_tokens);
+  const hasAnthropicCacheUsage = cacheCreationInputTokens != null || asNumber(usage.cache_read_input_tokens) != null;
+  const nonCacheInputTokens = hasAnthropicCacheUsage
+    ? providerInputTokens
+    : providerInputTokens != null
+      ? Math.max(0, providerInputTokens - (cacheReadInputTokens ?? 0))
+      : undefined;
+  const inputTokens = hasAnthropicCacheUsage
+    ? (nonCacheInputTokens ?? 0) + (cacheCreationInputTokens ?? 0) + (cacheReadInputTokens ?? 0)
+    : providerInputTokens;
+  const totalTokens =
+    asNumber(usage.total_tokens) ??
+    (inputTokens != null || outputTokens != null ? (inputTokens ?? 0) + (outputTokens ?? 0) : undefined);
 
   if (
     inputTokens == null &&
+    nonCacheInputTokens == null &&
     outputTokens == null &&
     totalTokens == null &&
     reasoningTokens == null &&
@@ -205,6 +218,7 @@ export function normalizeUsage(usage: Record<string, unknown> | null | undefined
 
   return {
     inputTokens,
+    nonCacheInputTokens,
     outputTokens,
     totalTokens,
     reasoningTokens,
@@ -252,7 +266,7 @@ export function denormalizeUsageToOpenAIResponses(usage: NormalizedUsage | undef
 export function denormalizeUsageToAnthropic(usage: NormalizedUsage | undefined): Record<string, unknown> | undefined {
   if (!usage) return undefined;
 
-  const inputTokens = usage.inputTokens;
+  const inputTokens = usage.nonCacheInputTokens ?? usage.inputTokens;
   const outputTokens = usage.outputTokens;
 
   if (inputTokens == null && outputTokens == null && usage.cacheCreationInputTokens == null && usage.cacheReadInputTokens == null) return undefined;

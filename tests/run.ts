@@ -727,6 +727,74 @@ run("anthropic response thinking block is preserved in responses response", () =
   assert.equal((responses.output[1] as any).type, "message");
 });
 
+run("anthropic response usage total includes cache read and write when converted to responses", () => {
+  const responses = anthropicMessageToResponsesResponse({
+    id: "msg_usage_total",
+    type: "message",
+    role: "assistant",
+    model: "claude-sonnet-4-5",
+    container: null,
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    content: [
+      {
+        type: "text",
+        text: "ok",
+        citations: null,
+      },
+    ],
+    usage: {
+      input_tokens: 300,
+      output_tokens: 100,
+      cache_creation_input_tokens: 200,
+      cache_read_input_tokens: 500,
+      server_tool_use: null,
+    },
+  } as any);
+
+  assert.deepEqual((responses as any).usage, {
+    input_tokens: 1000,
+    output_tokens: 100,
+    total_tokens: 1100,
+    input_tokens_details: { cached_tokens: 500 },
+  });
+});
+
+run("openai chat usage keeps anthropic non-cache input separate when converted", () => {
+  const anthropic = chatCompletionToAnthropicMessage({
+    id: "chat_usage_total",
+    object: "chat.completion",
+    created: 1,
+    model: "gpt-4o-mini",
+    choices: [
+      {
+        index: 0,
+        finish_reason: "stop",
+        logprobs: null,
+        message: {
+          role: "assistant",
+          content: "ok",
+          refusal: null,
+        },
+      },
+    ],
+    usage: {
+      prompt_tokens: 1000,
+      completion_tokens: 200,
+      total_tokens: 1200,
+      prompt_tokens_details: { cached_tokens: 600 },
+      prompt_cache_hit_tokens: 600,
+    },
+  } as any);
+
+  assert.deepEqual((anthropic as any).usage, {
+    input_tokens: 400,
+    output_tokens: 200,
+    cache_read_input_tokens: 600,
+    server_tool_use: null,
+  });
+});
+
 run("anthropic thinking budget 4000 maps to chat medium reasoning_effort", () => {
   const chat = anthropicMessageRequestToChatParams({
     model: "claude-sonnet-4-5",
