@@ -36,8 +36,6 @@ import {
   setRecordedClientResponseBody,
   setRecordedClientResponseMeta,
   setRecordedRequestError,
-  startRecording,
-  stopRecording,
 } from "./src/record.js";
 import type { StreamFormat } from "./src/converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse } from "./src/converters/shared.js";
@@ -442,7 +440,15 @@ function buildStreamReadable(
   const started = Date.now();
   let cancelled = false;
   let finished = false;
+  let successRecorded = false;
+  const cachedRequestId = getRequestId();
   let cancelPromise: Promise<void> | undefined;
+
+  function settleSuccess(usage?: import("./src/converters/shared.js").NormalizedUsage) {
+    if (successRecorded) return;
+    successRecorded = true;
+    statusStore.recordSuccess(modelName, Date.now() - timing.startedAt, timing.ttfbMs, usage, timing.startedAt);
+  }
 
   return new ReadableStream({
     async pull(controller) {
@@ -459,7 +465,7 @@ function buildStreamReadable(
               controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
             }
             const usage = usageCollector.finish();
-            statusStore.recordSuccess(modelName, Date.now() - timing.startedAt, timing.ttfbMs, usage, timing.startedAt);
+            settleSuccess(usage);
             console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms`));
             controller.close();
             return;
@@ -486,9 +492,14 @@ function buildStreamReadable(
     cancel(reason) {
       if (cancelled || finished) return cancelPromise;
       cancelled = true;
-      console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`));
+      if (usageCollector.hasCompleted()) {
+        settleSuccess(usageCollector.getLatestUsage());
+        console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (client closed after completion)`, cachedRequestId));
+      } else {
+        console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`, cachedRequestId));
+      }
       cancelPromise = reader.cancel(reason).catch((error) => {
-        console.warn(withRequestId(`[HTTP STREAM CANCEL ERROR] path=${path} duration=${Date.now() - started}ms`), error);
+        console.warn(withRequestId(`[HTTP STREAM CANCEL ERROR] path=${path} duration=${Date.now() - started}ms`, cachedRequestId), error);
       });
       return cancelPromise;
     },
@@ -517,6 +528,8 @@ function buildPipeStreamAndCache(
   const started = Date.now();
   let cancelled = false;
   let finished = false;
+  let successRecorded = false;
+  const cachedRequestId = getRequestId();
   let cancelPromise: Promise<void> | undefined;
 
   function collectItems(sseText: string) {
@@ -528,6 +541,12 @@ function buildPipeStreamAndCache(
         }
       } catch {}
     }
+  }
+
+  function settleSuccess(usage?: import("./src/converters/shared.js").NormalizedUsage) {
+    if (successRecorded) return;
+    successRecorded = true;
+    statusStore.recordSuccess(modelName, Date.now() - timing.startedAt, timing.ttfbMs, usage, timing.startedAt);
   }
 
   return new ReadableStream({
@@ -557,7 +576,7 @@ function buildPipeStreamAndCache(
             }
             cacheResponseItems(outputItems);
             const usage = usageCollector.finish();
-            statusStore.recordSuccess(modelName, Date.now() - timing.startedAt, timing.ttfbMs, usage, timing.startedAt);
+            settleSuccess(usage);
             console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms`));
             controller.close();
             return;
@@ -592,9 +611,14 @@ function buildPipeStreamAndCache(
     cancel(reason) {
       if (cancelled || finished) return cancelPromise;
       cancelled = true;
-      console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`));
+      if (usageCollector.hasCompleted()) {
+        settleSuccess(usageCollector.getLatestUsage());
+        console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (client closed after completion)`, cachedRequestId));
+      } else {
+        console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`, cachedRequestId));
+      }
       cancelPromise = reader.cancel(reason).catch((error) => {
-        console.warn(withRequestId(`[HTTP STREAM CANCEL ERROR] path=${path} duration=${Date.now() - started}ms`), error);
+        console.warn(withRequestId(`[HTTP STREAM CANCEL ERROR] path=${path} duration=${Date.now() - started}ms`, cachedRequestId), error);
       });
       return cancelPromise;
     },
@@ -617,8 +641,6 @@ app.get("/", (c) => {
       record: "GET /record",
       recordSummary: "GET /record/summary",
       recordQuery: "GET /record/{requestId}",
-      recordStart: "POST /record/start",
-      recordStop: "POST /record/stop",
       chat: "POST /v1/chat/completions",
       responses: "POST /v1/responses",
       messages: "POST /v1/messages",
@@ -632,8 +654,6 @@ app.get("/status", (c) => c.html(renderStatusPage(buildStatusPayload())));
 app.get("/status/data", (c) => c.json(buildStatusPayload()));
 app.get("/record", (c) => c.html(renderRecordPage(getRecordSummary())));
 app.get("/record/summary", (c) => c.json(getRecordSummary()));
-app.post("/record/start", (c) => c.json(startRecording()));
-app.post("/record/stop", (c) => c.json(stopRecording()));
 app.get("/record/:requestId", (c) => {
   const requestId = c.req.param("requestId");
   const payload = buildRecordQueryPayload(requestId);

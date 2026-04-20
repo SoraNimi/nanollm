@@ -40,8 +40,8 @@ export function isResponsesCustomToolName(name: string): boolean {
   return requestContext.getStore()?.responsesCustomToolNames.has(name) ?? false;
 }
 
-export function withRequestId(message: string): string {
-  const requestId = getRequestId();
+export function withRequestId(message: string, fallbackRequestId?: string): string {
+  const requestId = getRequestId() ?? fallbackRequestId;
   const timestamp = `[${formatTimestamp()}]`;
   return requestId ? `${timestamp} [requestId=${requestId.slice(0, 6)}] ${message}` : `${timestamp} ${message}`;
 }

@@ -121,16 +121,25 @@ function resolveRequestId(requestId?: string): string | undefined {
 }
 
 class RecordStore {
-  enabled = false;
+  enabled = true;
   capturedCount = 0;
   readonly limit = RECORD_LIMIT;
   sessionStartedAt?: number;
   private readonly records = new Map<string, RecordEntry>();
 
+  private evictOldestIfNeeded() {
+    if (this.records.size < this.limit || this.records.size === 0) return;
+    const oldestKey = this.records.keys().next().value;
+    if (oldestKey) {
+      this.records.delete(oldestKey);
+      this.capturedCount = Math.max(0, this.capturedCount - 1);
+    }
+  }
+
   start() {
     this.enabled = true;
     this.capturedCount = 0;
-    this.sessionStartedAt = Date.now();
+    if (!this.sessionStartedAt) this.sessionStartedAt = Date.now();
     this.records.clear();
   }
 
@@ -165,9 +174,10 @@ class RecordStore {
     body: unknown;
     stream: boolean;
   }): boolean {
-    if (!this.enabled || this.capturedCount >= this.limit) return false;
+    if (!this.enabled) return false;
     const key = getRecordKey(input.requestId);
     if (this.records.has(key)) return true;
+    this.evictOldestIfNeeded();
     this.records.set(key, {
       requestId: input.requestId,
       key,

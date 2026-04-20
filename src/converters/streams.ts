@@ -556,6 +556,7 @@ export class ResponsesStreamEmitter implements StreamEmitter {
   private blockTypes = new Map<number, string>();
   private accumulated = new Map<number, string>();
   private toolCallInfo = new Map<number, { id: string; name: string; custom: boolean; wrapped: boolean }>();
+  private wrappedToolDecodedLengths = new Map<number, number>();
   private itemIds = new Map<number, string>();
   // Accumulate completed content parts and output items for done/completed events
   private messageContentParts: Record<string, unknown>[] = [];
@@ -680,6 +681,7 @@ export class ResponsesStreamEmitter implements StreamEmitter {
         this.accumulated.set(event.index, "");
         const custom = event.kind === "custom" || isResponsesCustomToolName(event.name);
         this.toolCallInfo.set(event.index, { id: event.id, name: event.name, custom, wrapped: custom && event.kind !== "custom" });
+        this.wrappedToolDecodedLengths.set(event.index, 0);
         const oi = this.outputIndex++;
         const itemId = this.makeItemId(oi, event.id || "fc");
         this.blockToMapping.set(event.index, { outputIndex: oi });
@@ -706,6 +708,19 @@ export class ResponsesStreamEmitter implements StreamEmitter {
           out.push({ type: "response.function_call_arguments.delta", item_id: itemId, output_index: mapping.outputIndex, delta: event.delta, sequence_number: this.nextSeq() });
         } else if (!info.wrapped) {
           out.push({ type: "response.custom_tool_call_input.delta", item_id: itemId, output_index: mapping.outputIndex, delta: event.delta, sequence_number: this.nextSeq() });
+        } else {
+          const decodedPrefix = decodeWrappedCustomToolInputPrefix(acc);
+          const emittedLength = this.wrappedToolDecodedLengths.get(event.index) ?? 0;
+          if (decodedPrefix.length > emittedLength) {
+            out.push({
+              type: "response.custom_tool_call_input.delta",
+              item_id: itemId,
+              output_index: mapping.outputIndex,
+              delta: decodedPrefix.slice(emittedLength),
+              sequence_number: this.nextSeq(),
+            });
+            this.wrappedToolDecodedLengths.set(event.index, decodedPrefix.length);
+          }
         }
         break;
       }
@@ -723,7 +738,16 @@ export class ResponsesStreamEmitter implements StreamEmitter {
           : { id: itemId, type: "function_call", status: "completed", call_id: info?.id ?? "", name: info?.name ?? "", arguments: acc };
         this.completedOutputItems.set(mapping.outputIndex, fcItem);
         if (info?.custom && info.wrapped && customInput) {
-          out.push({ type: "response.custom_tool_call_input.delta", item_id: itemId, output_index: mapping.outputIndex, delta: customInput, sequence_number: this.nextSeq() });
+          const emittedLength = this.wrappedToolDecodedLengths.get(event.index) ?? 0;
+          if (customInput.length > emittedLength) {
+            out.push({
+              type: "response.custom_tool_call_input.delta",
+              item_id: itemId,
+              output_index: mapping.outputIndex,
+              delta: customInput.slice(emittedLength),
+              sequence_number: this.nextSeq(),
+            });
+          }
         }
         out.push(
           info?.custom
@@ -754,6 +778,69 @@ export class ResponsesStreamEmitter implements StreamEmitter {
 
   finish(): Record<string, unknown>[] {
     return [];
+  }
+}
+
+function decodeWrappedCustomToolInputPrefix(argumentsText: string): string {
+  const valueStart = findWrappedCustomToolStringStart(argumentsText);
+  if (valueStart < 0) return "";
+  return decodeJsonStringPrefix(argumentsText.slice(valueStart));
+}
+
+function findWrappedCustomToolStringStart(argumentsText: string): number {
+  const match = /^\s*\{\s*"(?:content|arg)"\s*:\s*"/.exec(argumentsText);
+  return match ? match[0].length : -1;
+}
+
+function decodeJsonStringPrefix(text: string): string {
+  let result = "";
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === "\"") break;
+    if (ch !== "\\") {
+      result += ch;
+      continue;
+    }
+
+    if (i + 1 >= text.length) break;
+    const esc = text[i + 1];
+    if (esc === "u") {
+      if (i + 5 >= text.length) break;
+      const hex = text.slice(i + 2, i + 6);
+      if (!/^[0-9a-fA-F]{4}$/.test(hex)) break;
+      result += String.fromCharCode(parseInt(hex, 16));
+      i += 5;
+      continue;
+    }
+
+    const mapped = mapJsonEscapeCharacter(esc);
+    if (mapped == null) break;
+    result += mapped;
+    i += 1;
+  }
+  return result;
+}
+
+function mapJsonEscapeCharacter(ch: string): string | null {
+  switch (ch) {
+    case "\"":
+      return "\"";
+    case "\\":
+      return "\\";
+    case "/":
+      return "/";
+    case "b":
+      return "\b";
+    case "f":
+      return "\f";
+    case "n":
+      return "\n";
+    case "r":
+      return "\r";
+    case "t":
+      return "\t";
+    default:
+      return null;
   }
 }
 
@@ -1075,11 +1162,15 @@ export function createUsageCollector(format: StreamFormat) {
   const sseParser = new SSEParser();
   const parser = createParser(format);
   let latestUsage: import("./shared.js").NormalizedUsage | undefined;
+  let sawEnd = false;
 
   function collect(events: NormalizedStreamEvent[]) {
     for (const event of events) {
-      if (event.type === "end" && event.usage) {
-        latestUsage = event.usage;
+      if (event.type === "end") {
+        sawEnd = true;
+        if (event.usage) {
+          latestUsage = event.usage;
+        }
       }
     }
   }
@@ -1099,6 +1190,12 @@ export function createUsageCollector(format: StreamFormat) {
         } catch {}
       }
       collect(parser.finish());
+      return latestUsage;
+    },
+    hasCompleted() {
+      return sawEnd;
+    },
+    getLatestUsage() {
       return latestUsage;
     },
   };

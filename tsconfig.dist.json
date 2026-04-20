@@ -5,6 +5,6 @@
     "outDir": "dist",
     "rootDir": "."
   },
-  "include": ["cli.ts", "server.ts", "src/**/*.ts"],
+  "include": ["cli.ts", "server.ts", "src/**/*.ts", "src/**/*.tsx"],
   "exclude": ["tests/**/*.ts", "src/converters/test.ts", "src/converters/testres.ts"]
 }

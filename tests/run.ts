@@ -608,6 +608,135 @@ run("chat stream restores converted custom tools in responses events", () => {
   });
 });
 
+run("responses custom tool stream preserves windows paths through chat arguments", () => {
+  const converter = createSSEConverter("openai-responses", "openai-chat");
+  const input = "*** Begin Patch\n*** Update File: C:\\temp\\docs\\file.md\n*** End Patch\n";
+  const chunks = [
+    ...converter.push(
+      [
+        { type: "response.created", response: { id: "resp_windows_path", object: "response", created_at: 1, model: "gpt-5.4", status: "in_progress", output: [], usage: null } },
+        { type: "response.output_item.added", output_index: 0, item: { id: "item_windows_path", type: "custom_tool_call", status: "in_progress", call_id: "call_windows_path", name: "apply_patch", input: "" }, sequence_number: 1 },
+        { type: "response.custom_tool_call_input.delta", item_id: "item_windows_path", output_index: 0, delta: "*** Begin Patch\n*** Update File: C:\\temp\\", sequence_number: 2 },
+        { type: "response.custom_tool_call_input.delta", item_id: "item_windows_path", output_index: 0, delta: "docs\\file.md\n*** End Patch\n", sequence_number: 3 },
+        { type: "response.custom_tool_call_input.done", item_id: "item_windows_path", output_index: 0, name: "apply_patch", input, sequence_number: 4 },
+        { type: "response.completed", response: { id: "resp_windows_path", object: "response", created_at: 1, model: "gpt-5.4", status: "completed", output: [{ id: "item_windows_path", type: "custom_tool_call", status: "completed", call_id: "call_windows_path", name: "apply_patch", input }], usage: null }, sequence_number: 5 },
+      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    ),
+    ...converter.flush(),
+  ];
+
+  const events = parseSSEObjects(chunks);
+  const toolArgChunks = events
+    .flatMap((event) => event.data.choices ?? [])
+    .flatMap((choice: any) => choice.delta?.tool_calls ?? [])
+    .map((toolCall: any) => toolCall.function?.arguments ?? "")
+    .filter(Boolean);
+  const argumentsText = toolArgChunks.join("");
+
+  assert.equal(JSON.parse(argumentsText).content, input);
+});
+
+run("chat stream restores wrapped custom tool windows paths exactly", () => {
+  runWithRequestId("req_custom_stream_windows_path", () => {
+    responsesRequestToChatParams({
+      model: "gpt-5",
+      input: "hello",
+      tools: [{ type: "custom", name: "apply_patch", description: "patch", format: { type: "grammar" } }],
+      tool_choice: { type: "custom", name: "apply_patch" },
+    } as any);
+
+    const input = "*** Begin Patch\n*** Update File: C:\\temp\\docs\\file.md\n*** End Patch\n";
+    const converter = createSSEConverter("openai-chat", "openai-responses");
+    const chunks = [
+      ...converter.push(
+        [
+          {
+            id: "resp_custom_stream_windows_path",
+            object: "chat.completion.chunk",
+            created: 1,
+            model: "gpt-5.4",
+            choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+          },
+          {
+            id: "resp_custom_stream_windows_path",
+            object: "chat.completion.chunk",
+            created: 1,
+            model: "gpt-5.4",
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "call_custom_stream_windows_path",
+                      type: "function",
+                      function: { name: "apply_patch", arguments: "{\"content\":\"" },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          },
+          {
+            id: "resp_custom_stream_windows_path",
+            object: "chat.completion.chunk",
+            created: 1,
+            model: "gpt-5.4",
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      function: { arguments: "*** Begin Patch\\n*** Update File: C:\\\\temp\\\\" },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          },
+          {
+            id: "resp_custom_stream_windows_path",
+            object: "chat.completion.chunk",
+            created: 1,
+            model: "gpt-5.4",
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      function: { arguments: "docs\\\\file.md\\n*** End Patch\\n\"}" },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          },
+        ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+      ),
+      ...converter.flush(),
+    ];
+
+    const events = parseSSEObjects(chunks);
+    const deltaEvents = events.filter((event) => event.event === "response.custom_tool_call_input.delta");
+    const completed = events.find((event) => event.event === "response.completed");
+
+    assert.deepEqual(
+      deltaEvents.map((event) => event.data.delta),
+      ["*** Begin Patch\n*** Update File: C:\\temp\\", "docs\\file.md\n*** End Patch\n"],
+    );
+    assert.ok(completed);
+    assert.equal(completed?.data.response.output[0].input, input);
+  });
+});
+
 run("chat verbosity survives chat to responses to chat", () => {
   const responses = chatParamsToResponsesRequest({
     model: "gpt-5",
@@ -1686,7 +1815,8 @@ run("record store only captures the first 100 requests", () => {
     });
   }
   assert.equal(getRecordSummary().capturedCount, 100);
-  assert.equal(getRecordedRequest("000100"), undefined);
+  assert.equal(getRecordSummary().size, 100);
+  assert.equal(getRecordedRequest("000000"), undefined);
   stopRecording();
 });
 
@@ -1715,14 +1845,15 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /record-border-crawl/);
   assert.match(html, /background-position:/);
   assert.doesNotMatch(html, /recording-border/);
-  assert.match(html, /classList\.toggle\("recording", summary\.enabled === true\)/);
+  assert.match(html, /classList\.toggle\("recording", true\)/);
   assert.match(html, /list="request-id-options"/);
   assert.match(html, /placeholder="例如 6dfae2"/);
   assert.match(html, /grid-template-columns: 1fr/);
   assert.match(html, /recent-key/);
   assert.match(html, /recent-more/);
   assert.match(html, /slice\(0, 10\)/);
-  assert.match(html, /开始采样/);
+  assert.doesNotMatch(html, /开始采样/);
+  assert.doesNotMatch(html, /停止采样/);
 });
 
 run("http log level only keeps /v1 lifecycle logs at info", () => {

@@ -63,9 +63,28 @@ Run the proxy server:
 npx nanollm --config /path/to/config.yaml
 ```
 
+对外提供的模型为所有`models[i].name`和`fallback.[group_name]`例如上面demo配置就提供了
+```
+gpt-5.4-a
+gpt-5.4-b
+glm5.1
+claude-sonnet-4-6
+gpt-5.4
+```
+这样5个模型，其中`gpt-5.4`是兜底分组名，当使用这个模型的时候，会在下属列表的模型中寻找可用的模型，尝试顺序为（最近5min失败次数-2）倒序。
+
+
 如果当前目录就有 `config.yaml`，也可以直接运行：
 ```bash
 npx nanollm
 ```
 
 注意：npm 发布包不会包含作者本地的 `config.yaml`，需要你自己准备配置文件。
+
+## Monitor
+
+提供了`http://localhost:3000/status`的监控页面，可以查看模型健康状态。
+
+提供了`http://localhost:3000/record`的采样记录页面，可以查看请求记录，对debug非常有用（只保留最新100次请求）。
+
+上述数据都只存在内存中，进程结束即消失，作为一个超轻量工具，没有任何持久化存储。

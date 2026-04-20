@@ -1,4 +1,13 @@
+import { renderToString } from "hono/jsx/dom/server";
 import type { StatusCell } from "./status.js";
+
+function serializeForScript(value: unknown): string {
+  return JSON.stringify(value)
+    .replaceAll("<", "\\u003c")
+    .replaceAll(">", "\\u003e")
+    .replaceAll("&", "\\u0026");
+}
+
 
 export interface StatusPageModel {
   name: string;
@@ -13,21 +22,7 @@ export interface StatusPagePayload {
   models: StatusPageModel[];
 }
 
-function serializeForScript(value: unknown): string {
-  return JSON.stringify(value)
-    .replaceAll("<", "\\u003c")
-    .replaceAll(">", "\\u003e")
-    .replaceAll("&", "\\u0026");
-}
-
-export function renderStatusPage(payload: StatusPagePayload): string {
-  return `<!doctype html>
-<html lang="zh-CN">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>nanollm status</title>
-    <style>
+const STYLE = /* css */ String.raw`
       :root {
         color-scheme: light;
         --bg: #f5f1e8;
@@ -268,37 +263,10 @@ export function renderStatusPage(payload: StatusPagePayload): string {
           justify-content: space-between;
         }
       }
-    </style>
-  </head>
-  <body>
-    <main class="page">
-      <section class="panel">
-        <h1>Model Health</h1>
-        <p class="meta">只展示真实模型，按 5 分钟窗口记录到内存，最多保留最近 6 小时。</p>
-        <div class="toolbar">
-          <div class="range-buttons" id="range-buttons"></div>
-          <div class="range-meta" id="range-meta"></div>
-        </div>
-        <div class="legend">
-          <span><i class="dot green"></i>100%</span>
-          <span><i class="dot lightgreen"></i>80%+</span>
-          <span><i class="dot orange"></i>50%+</span>
-          <span><i class="dot red"></i>&lt;50%</span>
-          <span><i class="dot empty"></i>无数据</span>
-        </div>
-        <div class="header">
-          <div class="header-label">Models</div>
-          <div class="cells" id="ticks"></div>
-        </div>
-        <div id="rows"></div>
-      </section>
-    </main>
-    <aside class="tooltip" id="tooltip" aria-hidden="true">
-      <p class="tooltip-title" id="tooltip-title"></p>
-      <dl class="tooltip-grid" id="tooltip-grid"></dl>
-    </aside>
-    <script>
-      const STATUS_DATA = ${serializeForScript(payload)};
+`;
+
+const SCRIPT = String.raw`
+      const STATUS_DATA = __INITIAL_PAYLOAD__;
       const TICKS_EL = document.getElementById("ticks");
       const ROWS_EL = document.getElementById("rows");
       const RANGE_META_EL = document.getElementById("range-meta");
@@ -506,7 +474,54 @@ export function renderStatusPage(payload: StatusPagePayload): string {
 
       render(currentHours);
       setInterval(refreshStatus, REFRESH_INTERVAL_MS);
-    </script>
-  </body>
-</html>`;
+`;
+
+function StatusPage({ payload }: { payload: StatusPagePayload }) {
+  return (
+    <html lang="zh-CN">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>nanollm status</title>
+        <style dangerouslySetInnerHTML={{ __html: STYLE }} />
+      </head>
+      <body>
+    <main class="page">
+      <section class="panel">
+        <h1>Model Health</h1>
+        <p class="meta">只展示真实模型，按 5 分钟窗口记录到内存，最多保留最近 6 小时。</p>
+        <div class="toolbar">
+          <div class="range-buttons" id="range-buttons"></div>
+          <div class="range-meta" id="range-meta"></div>
+        </div>
+        <div class="legend">
+          <span><i class="dot green"></i>100%</span>
+          <span><i class="dot lightgreen"></i>80%+</span>
+          <span><i class="dot orange"></i>50%+</span>
+          <span><i class="dot red"></i>&lt;50%</span>
+          <span><i class="dot empty"></i>无数据</span>
+        </div>
+        <div class="header">
+          <div class="header-label">Models</div>
+          <div class="cells" id="ticks"></div>
+        </div>
+        <div id="rows"></div>
+      </section>
+    </main>
+    <aside class="tooltip" id="tooltip" aria-hidden="true">
+      <p class="tooltip-title" id="tooltip-title"></p>
+      <dl class="tooltip-grid" id="tooltip-grid"></dl>
+    </aside>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: SCRIPT.replace("__INITIAL_PAYLOAD__", serializeForScript(payload)),
+          }}
+        />
+      </body>
+    </html>
+  );
+}
+
+export function renderStatusPage(payload: StatusPagePayload): string {
+  return "<!doctype html>" + renderToString(<StatusPage payload={payload} />);
 }

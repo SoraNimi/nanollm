@@ -1,3 +1,5 @@
+import { renderToString } from "hono/jsx/dom/server";
+
 function serializeForScript(value: unknown): string {
   return JSON.stringify(value)
     .replaceAll("<", "\\u003c")
@@ -10,20 +12,15 @@ const STRING_PREVIEW_LENGTH = 100;
 const SUMMARY_POLL_INTERVAL_MS = 3000;
 const RECENT_REQUEST_LIMIT = 10;
 
-export function renderRecordPage(summary: {
+export interface RecordSummary {
   enabled: boolean;
   capturedCount: number;
   limit: number;
   sessionStartedAt?: number;
   recentKeys?: Array<{ key: string; requestId: string; path: string; createdAt: number }>;
-}): string {
-  return `<!doctype html>
-<html lang="zh-CN">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>nanollm record</title>
-    <style>
+}
+
+const STYLE = /* css */ String.raw`
       :root {
         color-scheme: light;
         --bg: #f2efe7;
@@ -423,34 +420,10 @@ export function renderRecordPage(summary: {
           grid-template-columns: 1fr;
         }
       }
-    </style>
-  </head>
-  <body>
-    <main class="page">
-      <section class="panel${summary.enabled ? " recording" : ""}" id="record-panel">
-        <h1>Request Record</h1>
-        <p class="meta">输入完整 requestId 或前 6 位，页面会调用查询接口并展示本轮采样缓存里的请求详情。</p>
-        <div class="toolbar">
-          <div>
-            <label for="request-id">requestId</label>
-            <input id="request-id" name="requestId" list="${REQUEST_ID_DATALIST_ID}" placeholder="例如 6dfae2" />
-            <datalist id="${REQUEST_ID_DATALIST_ID}"></datalist>
-          </div>
-          <div class="actions">
-            <button id="query-button" type="button">查询</button>
-            <button id="start-button" class="secondary" type="button">开始采样</button>
-            <button id="stop-button" class="secondary" type="button">停止采样</button>
-          </div>
-        </div>
-        <div class="summary" id="summary"></div>
-        <div class="recent" id="recent"></div>
-        <div class="content" id="content">
-          <section class="section empty">还没有加载记录。</section>
-        </div>
-      </section>
-    </main>
-    <script>
-      const INITIAL_SUMMARY = ${serializeForScript(summary)};
+`;
+
+const SCRIPT = String.raw`
+      const INITIAL_SUMMARY = __INITIAL_SUMMARY__;
       const summaryEl = document.getElementById("summary");
       const recentEl = document.getElementById("recent");
       const contentEl = document.getElementById("content");
@@ -462,8 +435,8 @@ export function renderRecordPage(summary: {
         return value
           .trim()
           .replace(/^.*requestId=/i, "")
-          .replace(/^[\\[\\("'\\s]+/, "")
-          .replace(/[\\]\\)"'\\s,]+$/, "");
+          .replace(/^[\s\[("']+/, "")
+          .replace(/[\s,\])"']+$/, "");
       }
 
       function setRequestIdOptions(summary) {
@@ -490,13 +463,12 @@ export function renderRecordPage(summary: {
 
       function setSummary(summary) {
         setRequestIdOptions(summary);
-        recordPanelEl.classList.toggle("recording", summary.enabled === true);
+        recordPanelEl.classList.toggle("recording", true);
         summaryEl.textContent = "";
         const items = [
-          ["采样状态", summary.enabled ? "开启" : "关闭"],
           ["已采样", String(summary.capturedCount)],
           ["上限", String(summary.limit)],
-          ["开始时间", summary.sessionStartedAt ? new Date(summary.sessionStartedAt).toLocaleString("zh-CN") : "-"],
+          ["启动于", new Date(summary.sessionStartedAt ?? Date.now()).toLocaleString("zh-CN")],
         ];
         for (const [label, value] of items) {
           const pill = document.createElement("div");
@@ -697,16 +669,16 @@ export function renderRecordPage(summary: {
       }
 
       function parseStreamEvents(text) {
-        const normalized = text.replaceAll("\\r\\n", "\\n");
-        if (!/(^|\\n)(data|event|id|retry):/.test(normalized)) {
+        const normalized = text.replaceAll("\r\n", "\n");
+        if (!/(^|\n)(data|event|id|retry):/.test(normalized)) {
           return null;
         }
 
-        const blocks = normalized.split(/\\n\\n+/);
+        const blocks = normalized.split(/\n\n+/);
         const events = [];
         for (const block of blocks) {
           if (!block.trim()) continue;
-          const lines = block.split("\\n");
+          const lines = block.split("\n");
           let eventName;
           let sawField = false;
           const dataLines = [];
@@ -734,7 +706,7 @@ export function renderRecordPage(summary: {
           if (!sawField) {
             return null;
           }
-          const data = dataLines.join("\\n");
+          const data = dataLines.join("\n");
           let parsed;
           if (data && data !== "[DONE]") {
             try {
@@ -779,7 +751,104 @@ export function renderRecordPage(summary: {
             return payload.response;
           }
         }
-        return sawResponsesEvent ? lastResponse : null;
+        if (!sawResponsesEvent || !lastResponse) return null;
+
+        // If we didn't see response.completed, reconstruct output from delta events
+        const outputItems = new Map();
+        const contentBuffers = new Map();
+        const toolInputBuffers = new Map();
+
+        for (const item of events) {
+          const payload = item.parsed;
+          if (!payload || typeof payload !== "object") continue;
+          const type = item.event || payload.type;
+          if (typeof type !== "string") continue;
+
+          if (type === "response.output_item.added" && payload.item) {
+            const oi = payload.output_index ?? outputItems.size;
+            const base = { id: payload.item.id, status: payload.item.status ?? "in_progress" };
+            if (payload.item.type === "message") {
+              outputItems.set(oi, { ...base, type: "message", role: payload.item.role ?? "assistant", content: [] });
+            } else if (payload.item.type === "function_call") {
+              outputItems.set(oi, { ...base, type: "function_call", call_id: payload.item.call_id ?? "", name: payload.item.name ?? "", arguments: "" });
+            } else if (payload.item.type === "custom_tool_call") {
+              outputItems.set(oi, { ...base, type: "custom_tool_call", call_id: payload.item.call_id ?? "", name: payload.item.name ?? "", input: "" });
+            } else if (payload.item.type === "reasoning") {
+              outputItems.set(oi, { ...base, type: "reasoning", summary: [] });
+            } else {
+              outputItems.set(oi, { ...base, ...payload.item });
+            }
+          }
+
+          if (type === "response.content_part.added" && payload.part) {
+            var partKey = payload.output_index + "_" + payload.content_index;
+            contentBuffers.set(partKey, Object.assign({}, payload.part));
+          }
+
+          if (type === "response.output_text.delta" && payload.delta != null) {
+            var deltaKey = payload.output_index + "_" + payload.content_index;
+            const buf = contentBuffers.get(deltaKey);
+            if (buf) buf.text = (buf.text ?? "") + payload.delta;
+          }
+
+          if (type === "response.refusal.delta" && payload.delta != null) {
+            var refusalKey = payload.output_index + "_" + payload.content_index;
+            const buf = contentBuffers.get(refusalKey);
+            if (buf) buf.refusal = (buf.refusal ?? "") + payload.delta;
+          }
+
+          if (type === "response.reasoning_summary_text.delta" && payload.delta != null) {
+            const oi = payload.output_index;
+            const item = outputItems.get(oi);
+            if (item && item.type === "reasoning") {
+              const si = payload.summary_index ?? 0;
+              while (item.summary.length <= si) item.summary.push({ type: "summary_text", text: "" });
+              item.summary[si].text += payload.delta;
+            }
+          }
+
+          if (type === "response.function_call_arguments.delta" && payload.delta != null) {
+            const oi = payload.output_index;
+            var fcaKey = "tool_" + oi;
+            toolInputBuffers.set(fcaKey, (toolInputBuffers.get(fcaKey) ?? "") + payload.delta);
+          }
+
+          if (type === "response.custom_tool_call_input.delta" && payload.delta != null) {
+            const oi = payload.output_index;
+            var ctcKey = "tool_" + oi;
+            toolInputBuffers.set(ctcKey, (toolInputBuffers.get(ctcKey) ?? "") + payload.delta);
+          }
+        }
+
+        // Aggregate content parts into message output items
+        for (const [key, part] of contentBuffers) {
+          var oiStr = key.split("_")[0];
+          const oi = Number(oiStr);
+          const item = outputItems.get(oi);
+          if (item && item.type === "message") {
+            item.content.push(part);
+          }
+        }
+
+        // Finalize tool arguments / input
+        for (const [key, acc] of toolInputBuffers) {
+          const oi = Number(key.replace("tool_", ""));
+          const item = outputItems.get(oi);
+          if (!item) continue;
+          if (item.type === "function_call") {
+            item.arguments = acc;
+          } else if (item.type === "custom_tool_call") {
+            item.input = acc;
+          }
+        }
+
+        const result = { ...lastResponse };
+        if (outputItems.size > 0) {
+          result.output = [...outputItems.entries()]
+            .sort((a, b) => a[0] - b[0])
+            .map(([, v]) => v);
+        }
+        return result;
       }
 
       function reconstructOpenAIChatStream(events) {
@@ -1196,23 +1265,8 @@ export function renderRecordPage(summary: {
         history.replaceState(null, "", "/record?requestId=" + encodeURIComponent(requestId));
       }
 
-      async function controlRecord(action) {
-        const response = await fetch("/record/" + action, { method: "POST" });
-        const payload = await response.json();
-        setSummary(payload);
-        if (action === "start") {
-          contentEl.innerHTML = '<section class="section empty">新的采样会话已开始，等待请求进入。</section>';
-        }
-      }
-
       document.getElementById("query-button").addEventListener("click", () => {
         queryRecord().catch((error) => renderError(error instanceof Error ? error.message : "查询失败"));
-      });
-      document.getElementById("start-button").addEventListener("click", () => {
-        controlRecord("start").catch((error) => renderError(error instanceof Error ? error.message : "开始采样失败"));
-      });
-      document.getElementById("stop-button").addEventListener("click", () => {
-        controlRecord("stop").catch((error) => renderError(error instanceof Error ? error.message : "停止采样失败"));
       });
 
       setSummary(INITIAL_SUMMARY);
@@ -1226,7 +1280,50 @@ export function renderRecordPage(summary: {
         requestIdInput.value = preset;
         queryRecord().catch((error) => renderError(error instanceof Error ? error.message : "查询失败"));
       }
-    </script>
-  </body>
-</html>`;
+`;
+
+function RecordPage({ summary }: { summary: RecordSummary }) {
+  const panelClass = "panel recording";
+  return (
+    <html lang="zh-CN">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>nanollm record</title>
+        <style dangerouslySetInnerHTML={{ __html: STYLE }} />
+      </head>
+      <body>
+    <main class="page">
+      <section class={panelClass} id="record-panel">
+        <h1>Request Record</h1>
+        <p class="meta">输入完整 requestId 或前 6 位，页面会调用查询接口并展示本轮采样缓存里的请求详情。</p>
+        <div class="toolbar">
+          <div>
+            <label for="request-id">requestId</label>
+            <input id="request-id" name="requestId" list={REQUEST_ID_DATALIST_ID} placeholder="例如 6dfae2" />
+            <datalist id={REQUEST_ID_DATALIST_ID}></datalist>
+          </div>
+          <div class="actions">
+            <button id="query-button" type="button">查询</button>
+          </div>
+        </div>
+        <div class="summary" id="summary"></div>
+        <div class="recent" id="recent"></div>
+        <div class="content" id="content">
+          <section class="section empty">还没有加载记录。</section>
+        </div>
+      </section>
+    </main>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: SCRIPT.replace("__INITIAL_SUMMARY__", serializeForScript(summary)),
+          }}
+        />
+      </body>
+    </html>
+  );
+}
+
+export function renderRecordPage(summary: RecordSummary): string {
+  return "<!doctype html>" + renderToString(<RecordPage summary={summary} />);
 }
