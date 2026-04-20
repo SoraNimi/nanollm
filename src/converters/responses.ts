@@ -16,7 +16,10 @@ import {
   parseJson,
   refusal,
   text,
+  unwrapResponsesCustomToolInput,
+  wrapResponsesCustomToolInput,
 } from "./shared.js";
+import { isResponsesCustomToolName } from "../request-context.js";
 
 export function normalizeOpenAIChatResponse(response: OpenAIChatResponse): NormalizedResponse {
   const choice = response.choices[0];
@@ -26,6 +29,7 @@ export function normalizeOpenAIChatResponse(response: OpenAIChatResponse): Norma
     id: response.id,
     createdAt: response.created,
     model: response.model,
+    sourceFormat: "openai-chat",
     finishReason: choice?.finish_reason ?? null,
     message: {
       role: "assistant",
@@ -86,6 +90,7 @@ export function normalizeOpenAIResponsesResponse(response: OpenAIResponsesRespon
     id: response.id,
     createdAt: response.created_at,
     model: response.model,
+    sourceFormat: "openai-responses",
     finishReason: toolCalls.length > 0 ? "tool_calls" : response.status === "incomplete" ? "length" : "stop",
     message: {
       role: "assistant",
@@ -97,9 +102,7 @@ export function normalizeOpenAIResponsesResponse(response: OpenAIResponsesRespon
 }
 
 function normalizeCustomToolInputToFunctionArguments(input: any): string {
-  if (typeof input === "string") return JSON.stringify({ arg: input });
-  if (input === undefined) return JSON.stringify({ arg: "" });
-  return JSON.stringify(input);
+  return wrapResponsesCustomToolInput(input);
 }
 
 export function normalizeAnthropicResponse(response: AnthropicMessagesResponse): NormalizedResponse {
@@ -136,6 +139,7 @@ export function normalizeAnthropicResponse(response: AnthropicMessagesResponse):
     id: response.id,
     createdAt: 0,
     model: response.model,
+    sourceFormat: "anthropic",
     finishReason: response.stop_reason,
     message: {
       role: "assistant",
@@ -147,6 +151,7 @@ export function normalizeAnthropicResponse(response: AnthropicMessagesResponse):
 }
 
 export function denormalizeToOpenAIChatResponse(response: NormalizedResponse): OpenAIChatResponse {
+  const visibleParts = response.message.parts.filter((part) => part.type === "text" || part.type === "refusal");
   return {
     id: response.id,
     object: "chat.completion",
@@ -159,8 +164,8 @@ export function denormalizeToOpenAIChatResponse(response: NormalizedResponse): O
         logprobs: null,
         message: {
           role: "assistant",
-          content: response.message.parts.length === 0 ? null : response.message.parts.map((part) => (part.type === "text" ? { type: "text", text: part.text } : { type: "refusal", refusal: part.text })),
-          refusal: response.message.parts.find((part) => part.type === "refusal")?.text ?? null,
+          content: visibleParts.length === 0 ? null : visibleParts.map((part) => (part.type === "text" ? { type: "text", text: part.text } : { type: "refusal", refusal: part.text })),
+          refusal: visibleParts.find((part) => part.type === "refusal")?.text ?? null,
           tool_calls: response.message.toolCalls?.map((toolCall) =>
             toolCall.kind === "function"
               ? { id: toolCall.id, type: "function", function: { name: toolCall.name, arguments: toolCall.payload } }
@@ -174,45 +179,49 @@ export function denormalizeToOpenAIChatResponse(response: NormalizedResponse): O
 }
 
 export function denormalizeToOpenAIResponsesResponse(response: NormalizedResponse): OpenAIResponsesResponse {
+  const preserveThinking = response.sourceFormat === "openai-responses";
+  const visibleParts = response.message.parts.filter((part) => part.type === "text" || part.type === "refusal");
   return {
     id: response.id,
     object: "response",
     created_at: response.createdAt,
     model: response.model,
-    output_text: collapseText(response.message.parts.filter((part) => part.type === "text" || part.type === "refusal") as any),
+    output_text: collapseText(visibleParts as any),
     error: null,
     incomplete_details: null,
     instructions: null,
     // metadata: null,
     output: [
-      ...response.message.parts
-        .filter((part) => part.type === "thinking" || part.type === "redacted_thinking")
-        .map((part, index) =>
-          part.type === "thinking"
-            ? {
-                id: `reasoning_${index}`,
-                type: "reasoning",
-                summary: [{ type: "summary_text", text: part.thinking }],
-                content: [{ type: "reasoning_text", text: part.thinking }],
-                encrypted_content: part.signature ?? null,
-                status: "completed",
-              }
-            : {
-                id: `reasoning_${index}`,
-                type: "reasoning",
-                summary: [],
-                encrypted_content: part.data,
-                status: "completed",
-              },
-        ),
-      ...(response.message.parts.length > 0
+      ...(preserveThinking
+        ? response.message.parts
+            .filter((part) => part.type === "thinking" || part.type === "redacted_thinking")
+            .map((part, index) =>
+              part.type === "thinking"
+                ? {
+                    id: `reasoning_${index}`,
+                    type: "reasoning",
+                    summary: [{ type: "summary_text", text: part.thinking }],
+                    content: [{ type: "reasoning_text", text: part.thinking }],
+                    encrypted_content: part.signature ?? null,
+                    status: "completed",
+                  }
+                : {
+                    id: `reasoning_${index}`,
+                    type: "reasoning",
+                    summary: [],
+                    encrypted_content: part.data,
+                    status: "completed",
+                  },
+            )
+        : []),
+      ...(visibleParts.length > 0
         ? [
             {
               id: "msg_1",
               type: "message",
               role: "assistant",
               status: "completed",
-              content: response.message.parts.filter((part) => part.type !== "thinking" && part.type !== "redacted_thinking").map((part) =>
+              content: visibleParts.map((part) =>
                 part.type === "text"
                   ? { type: "output_text", text: part.text, annotations: [] }
                   : { type: "refusal", refusal: part.text },
@@ -221,9 +230,9 @@ export function denormalizeToOpenAIResponsesResponse(response: NormalizedRespons
           ]
         : []),
       ...(response.message.toolCalls?.map((toolCall) =>
-        toolCall.kind === "function"
-          ? { id: toolCall.id, type: "function_call", call_id: toolCall.id, name: toolCall.name, arguments: toolCall.payload, status: "completed" }
-          : { type: "custom_tool_call", call_id: toolCall.id, name: toolCall.name, input: toolCall.payload },
+        toolCall.kind === "custom" || (toolCall.kind === "function" && isResponsesCustomToolName(toolCall.name))
+          ? { id: toolCall.id, type: "custom_tool_call", call_id: toolCall.id, name: toolCall.name, input: toolCall.kind === "custom" ? toolCall.payload : unwrapResponsesCustomToolInput(toolCall.payload), status: "completed" }
+          : { id: toolCall.id, type: "function_call", call_id: toolCall.id, name: toolCall.name, arguments: toolCall.payload, status: "completed" },
       ) ?? []),
     ] as OpenAIResponsesResponse["output"],
     parallel_tool_calls: (response.message.toolCalls?.length ?? 0) > 1,
@@ -238,6 +247,7 @@ export function denormalizeToOpenAIResponsesResponse(response: NormalizedRespons
 }
 
 export function denormalizeToAnthropicResponse(response: NormalizedResponse): AnthropicMessagesResponse {
+  const preserveThinking = response.sourceFormat === "anthropic";
   return {
     id: response.id,
     type: "message",
@@ -247,11 +257,12 @@ export function denormalizeToAnthropicResponse(response: NormalizedResponse): An
     stop_reason: normalizeAnthropicStopReason(response.finishReason),
     stop_sequence: null,
     content: [
-      ...response.message.parts.map((part) => ({
-        type: "text" as const,
-        text: part.type === "text" || part.type === "refusal" ? part.text : collapseText([part]),
-        citations: null,
-      })),
+      ...response.message.parts.flatMap((part) => {
+        if (part.type === "text" || part.type === "refusal") return [{ type: "text" as const, text: part.text, citations: null }];
+        if (part.type === "thinking") return preserveThinking ? [{ type: "thinking" as const, thinking: part.thinking, signature: part.signature ?? "" }] : [];
+        if (part.type === "redacted_thinking") return preserveThinking ? [{ type: "redacted_thinking" as const, data: part.data }] : [];
+        return [{ type: "text" as const, text: collapseText([part]), citations: null }];
+      }),
       ...(response.message.toolCalls?.map((toolCall) => {
         if (toolCall.kind !== "function") fail("Anthropic response conversion only supports function-style tool calls");
         return {

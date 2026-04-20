@@ -62,6 +62,7 @@ export interface NormalizedMessage {
 
 export interface NormalizedRequest {
   model: string;
+  sourceFormat?: "openai-chat" | "openai-responses" | "anthropic";
   maxOutputTokens?: number;
   messages: NormalizedMessage[];
   tools?: NormalizedTool[];
@@ -100,6 +101,7 @@ export interface NormalizedResponse {
   id: string;
   createdAt: number;
   model: string;
+  sourceFormat?: "openai-chat" | "openai-responses" | "anthropic";
   finishReason: string | null;
   message: NormalizedMessage;
   usage?: NormalizedUsage;
@@ -148,6 +150,57 @@ export function parseJson(textValue: string, context: string): unknown {
 
 export function stringifyJson(value: unknown): string {
   return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function stringifyCustomToolValue(input: unknown): string {
+  if (typeof input === "string") return input;
+  if (input === undefined || input === null) return "";
+  return typeof input === "object" ? JSON.stringify(input) : String(input);
+}
+
+export function createResponsesCustomToolSchema(format?: unknown): Record<string, unknown> {
+  let contentDescription: string | undefined;
+  if (format && typeof format === "object") {
+    const f = format as Record<string, unknown>;
+    if (typeof f.definition === "string") {
+      const label = typeof f.syntax === "string" ? `${f.syntax} grammar` : `${f.type ?? "format"} grammar`;
+      contentDescription = `${label}:\n${f.definition}`;
+    }
+  }
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      content: {
+        type: "string",
+        ...(contentDescription ? { description: contentDescription } : {}),
+      },
+    },
+    required: ["content"],
+  };
+}
+
+export function wrapResponsesCustomToolInput(input: unknown): string {
+  return JSON.stringify({ content: stringifyCustomToolValue(input) });
+}
+
+export function unwrapResponsesCustomToolInput(argumentsText: string): string {
+  try {
+    const parsed = JSON.parse(argumentsText);
+    if (typeof parsed === "string") return parsed;
+    if (parsed && typeof parsed === "object") {
+      if (typeof (parsed as Record<string, unknown>).content === "string") {
+        return (parsed as Record<string, string>).content;
+      }
+      if (typeof (parsed as Record<string, unknown>).arg === "string") {
+        return (parsed as Record<string, string>).arg;
+      }
+      return stringifyCustomToolValue(parsed);
+    }
+    return stringifyCustomToolValue(parsed);
+  } catch {
+    return stringifyCustomToolValue(argumentsText);
+  }
 }
 
 export function makeDataUrl(mediaType: string, data: string): string {

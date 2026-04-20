@@ -14,6 +14,7 @@ import type {
 } from "./shared.js";
 import {
   collapseText,
+  createResponsesCustomToolSchema,
   fail,
   makeDataUrl,
   normalizeReasoningEffortFromBudget,
@@ -22,7 +23,9 @@ import {
   refusal,
   requireTextOnly,
   text,
+  wrapResponsesCustomToolInput,
 } from "./shared.js";
+import { markResponsesCustomToolName } from "../request-context.js";
 
 export function normalizeOpenAIChatRequest(request: OpenAIChatRequest): NormalizedRequest {
   const tools = request.tools?.flatMap((tool) => {
@@ -38,6 +41,7 @@ export function normalizeOpenAIChatRequest(request: OpenAIChatRequest): Normaliz
 
   return {
     model: request.model,
+    sourceFormat: "openai-chat",
     maxOutputTokens: request.max_completion_tokens ?? request.max_tokens ?? undefined,
     messages: request.messages.flatMap((message) => normalizeOpenAIChatMessage(message as any)),
     tools: [
@@ -83,6 +87,7 @@ export function normalizeOpenAIResponsesRequest(request: OpenAIResponsesRequest)
 
   return {
     model: request.model ?? "",
+    sourceFormat: "openai-responses",
     maxOutputTokens: request.max_output_tokens ?? undefined,
     messages,
     tools,
@@ -129,6 +134,7 @@ export function normalizeAnthropicRequest(request: AnthropicMessagesRequest): No
 
   return {
     model: request.model,
+    sourceFormat: "anthropic",
     maxOutputTokens: request.max_tokens,
     messages,
     tools,
@@ -157,6 +163,7 @@ export function denormalizeToOpenAIChatRequest(request: NormalizedRequest): Open
     metadata: request.metadata ?? undefined,
     service_tier: normalizeOpenAIServiceTier(request.serviceTier),
     stream: request.stream,
+    stream_options: request.stream ? { include_usage: true } : undefined,
     temperature: request.temperature ?? undefined,
     top_p: request.topP ?? undefined,
     stop: request.stopSequences,
@@ -192,7 +199,7 @@ export function denormalizeToOpenAIResponsesRequest(request: NormalizedRequest):
   return {
     model: request.model,
     instructions: instructionLines.length > 0 ? instructionLines.join("\n") : undefined,
-    input: request.messages.slice(index).flatMap((message) => denormalizeOpenAIResponsesMessage(message)) as any,
+    input: request.messages.slice(index).flatMap((message) => denormalizeOpenAIResponsesMessage(message, request.sourceFormat === "openai-responses")) as any,
     max_output_tokens: request.maxOutputTokens,
     // metadata: request.metadata ?? undefined,
     service_tier: normalizeOpenAIResponsesServiceTier(request.serviceTier),
@@ -229,11 +236,16 @@ export function denormalizeToAnthropicRequest(request: NormalizedRequest): Messa
     }
   }
 
+  const anthropicMessages =
+    request.sourceFormat === "anthropic"
+      ? filteredMessages
+      : ensureAnthropicMessagesEndWithUser(reorderMessagesForAnthropicToolResults(filteredMessages));
+
   return {
     model: request.model,
     max_tokens: maxTokens,
     system: systemBlocks.length > 0 ? systemBlocks : undefined,
-    messages: mergeAnthropicMessages(filteredMessages.flatMap((message) => denormalizeAnthropicMessage(message))),
+    messages: mergeAnthropicMessages(anthropicMessages.flatMap((message) => denormalizeAnthropicMessage(message, request.sourceFormat === "anthropic"))),
     metadata: denormalizeAnthropicMetadata(request.metadata),
     service_tier: normalizeAnthropicServiceTier(request.serviceTier),
     stream: request.stream,
@@ -347,9 +359,7 @@ function normalizeOpenAIResponsesInput(input: string | any[]): NormalizedMessage
 }
 
 function normalizeCustomToolInputToFunctionArguments(input: any): string {
-  if (typeof input === "string") return JSON.stringify({ arg: input });
-  if (input === undefined) return JSON.stringify({ arg: "" });
-  return JSON.stringify(input);
+  return wrapResponsesCustomToolInput(input);
 }
 
 function normalizeOpenAIResponsesMessage(item: any): NormalizedMessage {
@@ -393,13 +403,26 @@ function normalizeOpenAIResponsesToolOutput(output: any): NormalizedMessage["par
 
 function normalizeOpenAIResponsesTool(tool: any): NormalizedTool | undefined {
   if (tool.type === "function") return { kind: "function", name: tool.name, description: tool.description, inputSchema: tool.parameters ?? { type: "object" }, strict: tool.strict ?? null };
+  if (tool.type === "custom") {
+    markResponsesCustomToolName(tool.name);
+    return {
+      kind: "function",
+      name: tool.name,
+      description: tool.description,
+      inputSchema: createResponsesCustomToolSchema(tool.format),
+      strict: null,
+    };
+  }
   return undefined;
 }
 
 function normalizeOpenAIResponsesToolChoice(choice: any): NormalizedToolChoice | undefined {
   if (typeof choice === "string") return choice === "required" ? { type: "required" } : { type: choice };
   if (choice.type === "function") return { type: "tool", kind: "function", name: choice.name };
-  if (choice.type === "custom") return { type: "tool", kind: "custom", name: choice.name };
+  if (choice.type === "custom") {
+    markResponsesCustomToolName(choice.name);
+    return { type: "tool", kind: "function", name: choice.name };
+  }
   if (choice.type === "allowed_tools") return { type: choice.mode === "required" ? "required" : "auto" };
   return undefined;
 }
@@ -550,8 +573,12 @@ function denormalizeOpenAIChatMessage(message: NormalizedMessage): OpenAIChatReq
       return [{ role: "system", content: collapseText(requireTextOnly(message.parts, "Chat developer message")) }];
     case "user":
       return [{ role: "user", content: denormalizeOpenAIChatUserParts(message.parts) }];
-    case "assistant":
-      return [{ role: "assistant", content: denormalizeOpenAIChatAssistantParts(message.parts), refusal: message.parts.find((part) => part.type === "refusal")?.text ?? null, tool_calls: message.toolCalls?.map((toolCall) => denormalizeOpenAIChatToolCall(toolCall)) as any }];
+    case "assistant": {
+      const content = denormalizeOpenAIChatAssistantParts(message.parts);
+      const toolCalls = message.toolCalls?.map((toolCall) => denormalizeOpenAIChatToolCall(toolCall)) as any;
+      if (content === null && (!toolCalls || toolCalls.length === 0)) return [];
+      return [{ role: "assistant", content, refusal: message.parts.find((part) => part.type === "refusal")?.text ?? null, tool_calls: toolCalls }];
+    }
     case "tool":
       return denormalizeOpenAIChatToolResultMessage(message, message.toolCallId ?? "tool");
     case "function":
@@ -638,7 +665,7 @@ function denormalizeOpenAIResponsesToolOutput(parts: NormalizedMessage["parts"],
   return outputParts.every((part) => part.type === "input_text") ? outputParts.map((part) => part.text).join("\n") : outputParts;
 }
 
-function denormalizeOpenAIResponsesMessage(message: NormalizedMessage): any[] {
+function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveThinking: boolean): any[] {
   switch (message.role) {
     case "system":
     case "developer":
@@ -657,27 +684,29 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage): any[] {
       return contentParts.length > 0 ? [{ type: "message", role: message.role, content: contentParts }] : [];
     }
     case "assistant": {
-      const reasoningItems = message.parts
-        .filter((part) => part.type === "thinking" || part.type === "redacted_thinking")
-        .map((part, index) =>
-          part.type === "thinking"
-            ? {
-                id: `reasoning_${index}`,
-                type: "reasoning",
-                summary: [{ type: "summary_text", text: part.thinking }],
-                content: [{ type: "reasoning_text", text: part.thinking }],
-                encrypted_content: part.signature || null,
-                status: "completed",
-              }
-            : {
-                id: `reasoning_${index}`,
-                type: "reasoning",
-                summary: [],
-                content: [],
-                encrypted_content: part.data,
-                status: "completed",
-              },
-        );
+      const reasoningItems = preserveThinking
+        ? message.parts
+            .filter((part) => part.type === "thinking" || part.type === "redacted_thinking")
+            .map((part, index) =>
+              part.type === "thinking"
+                ? {
+                    id: `reasoning_${index}`,
+                    type: "reasoning",
+                    summary: [{ type: "summary_text", text: part.thinking }],
+                    content: [{ type: "reasoning_text", text: part.thinking }],
+                    encrypted_content: part.signature || null,
+                    status: "completed",
+                  }
+                : {
+                    id: `reasoning_${index}`,
+                    type: "reasoning",
+                    summary: [],
+                    content: [],
+                    encrypted_content: part.data,
+                    status: "completed",
+                  },
+            )
+        : [];
       
       const contentParts = message.parts
         .filter((part) => part.type !== "thinking" && part.type !== "redacted_thinking")
@@ -698,8 +727,6 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage): any[] {
       
       return [
         ...reasoningItems,
-        // Include message item if content is not empty OR if there are tool calls.
-        // Some Responses API implementations require an assistant message before function_call items.
         ...(contentParts.length > 0 || toolCallItems.length > 0 ? [{ type: "message", role: "assistant", content: contentParts }] : []),
         ...toolCallItems,
       ];
@@ -711,12 +738,14 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage): any[] {
   }
 }
 
-function denormalizeAnthropicMessage(message: NormalizedMessage): MessageParam[] {
+function denormalizeAnthropicMessage(message: NormalizedMessage, preserveThinking: boolean): MessageParam[] {
   switch (message.role) {
     case "user":
       return [{ role: "user", content: denormalizeAnthropicUserParts(message.parts) }];
-    case "assistant":
-      return [{ role: "assistant", content: denormalizeAnthropicAssistantParts(message) }];
+    case "assistant": {
+      const content = denormalizeAnthropicAssistantParts(message, preserveThinking);
+      return content.length > 0 ? [{ role: "assistant", content }] : [];
+    }
     case "tool":
       return [{ role: "user", content: [{ type: "tool_result", tool_use_id: message.toolCallId ?? "", is_error: message.isError ?? false, content: denormalizeAnthropicToolResultParts(message.parts) }] as any }];
     case "function":
@@ -740,11 +769,11 @@ function denormalizeAnthropicUserParts(parts: NormalizedMessage["parts"]): any {
   });
 }
 
-function denormalizeAnthropicAssistantParts(message: NormalizedMessage): any[] {
-  const blocks: any[] = message.parts.map((part) => {
+function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserveThinking: boolean): any[] {
+  const blocks: any[] = message.parts.flatMap((part) => {
     if (part.type === "text" || part.type === "refusal") return { type: "text", text: part.text, citations: null };
-    if (part.type === "thinking") return { type: "thinking", thinking: part.thinking, signature: part.signature ?? "" };
-    if (part.type === "redacted_thinking") return { type: "redacted_thinking", data: part.data };
+    if (part.type === "thinking") return preserveThinking ? [{ type: "thinking", thinking: part.thinking, signature: part.signature ?? "" }] : [];
+    if (part.type === "redacted_thinking") return preserveThinking ? [{ type: "redacted_thinking", data: part.data }] : [];
     return { type: "text", text: collapseText([part]), citations: null };
   });
   for (const toolCall of message.toolCalls ?? []) {
@@ -770,7 +799,7 @@ function denormalizeAnthropicToolResultParts(parts: NormalizedMessage["parts"]):
 
 function denormalizeAnthropicTool(tool: NormalizedTool): ToolUnion {
   if (tool.kind !== "function") fail("Anthropic request conversion only supports function-style tools");
-  return { name: tool.name, description: tool.description ?? undefined, input_schema: tool.inputSchema as any, strict: tool.strict ?? undefined };
+  return { name: tool.name, description: tool.description ?? undefined, input_schema: tool.inputSchema as any };
 }
 
 function denormalizeAnthropicToolChoice(choice: NormalizedToolChoice | undefined, parallelToolCalls: boolean | undefined, hasTools: boolean): MessageCreateParamsBase["tool_choice"] {
@@ -799,6 +828,54 @@ function mergeAnthropicMessages(messages: MessageParam[]): MessageParam[] {
     }
   }
   return merged;
+}
+
+function reorderMessagesForAnthropicToolResults(messages: NormalizedMessage[]): NormalizedMessage[] {
+  const used = new Array(messages.length).fill(false);
+  const reordered: NormalizedMessage[] = [];
+
+  for (let index = 0; index < messages.length; index += 1) {
+    if (used[index]) continue;
+    const message = messages[index];
+    used[index] = true;
+    reordered.push(message);
+
+    const pendingToolResultIds = getAnthropicPendingToolResultIds(message);
+    if (pendingToolResultIds.size === 0) continue;
+
+    for (let nextIndex = index + 1; nextIndex < messages.length; nextIndex += 1) {
+      if (used[nextIndex]) continue;
+      const candidate = messages[nextIndex];
+      const candidateToolResultId = getAnthropicToolResultId(candidate);
+      if (!candidateToolResultId || !pendingToolResultIds.has(candidateToolResultId)) continue;
+      used[nextIndex] = true;
+      reordered.push(candidate);
+      pendingToolResultIds.delete(candidateToolResultId);
+      if (pendingToolResultIds.size === 0) break;
+    }
+  }
+
+  return reordered;
+}
+
+function ensureAnthropicMessagesEndWithUser(messages: NormalizedMessage[]): NormalizedMessage[] {
+  const last = messages.at(-1);
+  if (!last || last.role === "user" || last.role === "tool" || last.role === "function") return messages;
+  return [...messages, { role: "user", parts: [text("go on")] }];
+}
+
+function getAnthropicPendingToolResultIds(message: NormalizedMessage): Set<string> {
+  if (message.role !== "assistant" || !message.toolCalls?.length) return new Set<string>();
+  const ids = message.toolCalls
+    .filter((toolCall) => toolCall.kind === "function")
+    .flatMap((toolCall) => (toolCall.id.endsWith(":legacy") ? [toolCall.id, toolCall.name] : [toolCall.id]));
+  return new Set(ids);
+}
+
+function getAnthropicToolResultId(message: NormalizedMessage): string | undefined {
+  if (message.role === "tool") return message.toolCallId ?? undefined;
+  if (message.role === "function") return message.name ?? undefined;
+  return undefined;
 }
 
 function denormalizeAnthropicMetadata(metadata: NormalizedRequest["metadata"]) {

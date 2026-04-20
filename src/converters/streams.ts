@@ -2,7 +2,8 @@
 import type { ChatCompletionChunk } from "openai/resources/chat/completions/completions";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
 import type { RawMessageStreamEvent } from "@anthropic-ai/sdk/resources/messages/messages";
-import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage } from "./shared.js";
+import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, unwrapResponsesCustomToolInput } from "./shared.js";
+import { isResponsesCustomToolName, } from "../request-context.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -238,12 +239,12 @@ export class ResponsesStreamParser implements StreamParser {
 
       case "response.output_item.added": {
         const item = event.item;
-        if (item.type === "function_call") {
+        if (item.type === "function_call" || item.type === "custom_tool_call") {
           this.seenToolCall = true;
           const idx = this.nextIndex++;
           const key = `tool_${event.output_index}`;
           this.blockMapping.set(key, idx);
-          out.push({ type: "tool_start", index: idx, id: item.call_id, name: item.name, kind: "function" });
+          out.push({ type: "tool_start", index: idx, id: item.call_id, name: item.name, kind: item.type === "custom_tool_call" ? "custom" : "function" });
         }
         break;
       }
@@ -291,6 +292,7 @@ export class ResponsesStreamParser implements StreamParser {
         if (!this.blockMapping.has(key)) {
           const idx = this.nextIndex++;
           this.blockMapping.set(key, idx);
+          this.seenToolCall = true;
           out.push({ type: "tool_start", index: idx, id: event.item_id || "", name: "", kind: "custom" });
         }
         const idx = this.blockMapping.get(key)!;
@@ -456,6 +458,11 @@ export class OpenAIChatStreamEmitter implements StreamEmitter {
   private blockTypes = new Map<number, string>();
   private toolCallCounter = 0;
   private blockToToolIndex = new Map<number, number>();
+  private toolKinds = new Map<number, "function" | "custom">();
+
+  private encodeCustomToolDelta(delta: string): string {
+    return JSON.stringify(delta).slice(1, -1);
+  }
 
   private chunk(delta: Record<string, unknown>, finishReason: string | null = null, usage?: import("./shared.js").NormalizedUsage): ChatCompletionChunk {
     return {
@@ -496,10 +503,11 @@ export class OpenAIChatStreamEmitter implements StreamEmitter {
       case "tool_start": {
         const tcIdx = this.toolCallCounter++;
         this.blockToToolIndex.set(event.index, tcIdx);
+        this.toolKinds.set(event.index, event.kind);
         this.blockTypes.set(event.index, "tool_call");
         out.push(
           this.chunk({
-            tool_calls: [{ index: tcIdx, id: event.id, type: "function", function: { name: event.name, arguments: "" } }],
+            tool_calls: [{ index: tcIdx, id: event.id, type: "function", function: { name: event.name, arguments: event.kind === "custom" ? "{\"content\":\"" : "" } }],
           }),
         );
         break;
@@ -508,7 +516,15 @@ export class OpenAIChatStreamEmitter implements StreamEmitter {
       case "tool_delta": {
         const tcIdx = this.blockToToolIndex.get(event.index);
         if (tcIdx != null) {
-          out.push(this.chunk({ tool_calls: [{ index: tcIdx, function: { arguments: event.delta } }] }));
+          out.push(this.chunk({ tool_calls: [{ index: tcIdx, function: { arguments: this.toolKinds.get(event.index) === "custom" ? this.encodeCustomToolDelta(event.delta) : event.delta } }] }));
+        }
+        break;
+      }
+
+      case "tool_done": {
+        const tcIdx = this.blockToToolIndex.get(event.index);
+        if (tcIdx != null && this.toolKinds.get(event.index) === "custom") {
+          out.push(this.chunk({ tool_calls: [{ index: tcIdx, function: { arguments: "\"}" } }] }));
         }
         break;
       }
@@ -539,7 +555,7 @@ export class ResponsesStreamEmitter implements StreamEmitter {
   private blockToMapping = new Map<number, { outputIndex: number; contentIndex?: number; summaryIndex?: number }>();
   private blockTypes = new Map<number, string>();
   private accumulated = new Map<number, string>();
-  private toolCallInfo = new Map<number, { id: string; name: string }>();
+  private toolCallInfo = new Map<number, { id: string; name: string; custom: boolean; wrapped: boolean }>();
   private itemIds = new Map<number, string>();
   // Accumulate completed content parts and output items for done/completed events
   private messageContentParts: Record<string, unknown>[] = [];
@@ -662,14 +678,17 @@ export class ResponsesStreamEmitter implements StreamEmitter {
       case "tool_start": {
         this.blockTypes.set(event.index, "tool_call");
         this.accumulated.set(event.index, "");
-        this.toolCallInfo.set(event.index, { id: event.id, name: event.name });
+        const custom = event.kind === "custom" || isResponsesCustomToolName(event.name);
+        this.toolCallInfo.set(event.index, { id: event.id, name: event.name, custom, wrapped: custom && event.kind !== "custom" });
         const oi = this.outputIndex++;
         const itemId = this.makeItemId(oi, event.id || "fc");
         this.blockToMapping.set(event.index, { outputIndex: oi });
         out.push({
           type: "response.output_item.added",
           output_index: oi,
-          item: { id: itemId, type: "function_call", status: "in_progress", call_id: event.id, name: event.name, arguments: "" },
+          item: custom
+            ? { id: itemId, type: "custom_tool_call", status: "in_progress", call_id: event.id, name: event.name, input: "" }
+            : { id: itemId, type: "function_call", status: "in_progress", call_id: event.id, name: event.name, arguments: "" },
           sequence_number: this.nextSeq(),
         });
         break;
@@ -682,7 +701,12 @@ export class ResponsesStreamEmitter implements StreamEmitter {
         this.accumulated.set(event.index, acc);
         const itemId = this.itemIds.get(mapping.outputIndex);
         if (!itemId) break;
-        out.push({ type: "response.function_call_arguments.delta", item_id: itemId, output_index: mapping.outputIndex, delta: event.delta, sequence_number: this.nextSeq() });
+        const info = this.toolCallInfo.get(event.index);
+        if (!info?.custom) {
+          out.push({ type: "response.function_call_arguments.delta", item_id: itemId, output_index: mapping.outputIndex, delta: event.delta, sequence_number: this.nextSeq() });
+        } else if (!info.wrapped) {
+          out.push({ type: "response.custom_tool_call_input.delta", item_id: itemId, output_index: mapping.outputIndex, delta: event.delta, sequence_number: this.nextSeq() });
+        }
         break;
       }
 
@@ -693,9 +717,19 @@ export class ResponsesStreamEmitter implements StreamEmitter {
         const itemId = this.itemIds.get(mapping.outputIndex);
         if (!itemId) break;
         const info = this.toolCallInfo.get(event.index);
-        const fcItem = { id: itemId, type: "function_call", status: "completed", call_id: info?.id ?? "", name: info?.name ?? "", arguments: acc };
+        const customInput = info?.custom ? (info.wrapped ? unwrapResponsesCustomToolInput(acc) : acc) : "";
+        const fcItem = info?.custom
+          ? { id: itemId, type: "custom_tool_call", status: "completed", call_id: info?.id ?? "", name: info?.name ?? "", input: customInput }
+          : { id: itemId, type: "function_call", status: "completed", call_id: info?.id ?? "", name: info?.name ?? "", arguments: acc };
         this.completedOutputItems.set(mapping.outputIndex, fcItem);
-        out.push({ type: "response.function_call_arguments.done", item_id: itemId, output_index: mapping.outputIndex, name: info?.name ?? "", arguments: acc, sequence_number: this.nextSeq() });
+        if (info?.custom && info.wrapped && customInput) {
+          out.push({ type: "response.custom_tool_call_input.delta", item_id: itemId, output_index: mapping.outputIndex, delta: customInput, sequence_number: this.nextSeq() });
+        }
+        out.push(
+          info?.custom
+            ? { type: "response.custom_tool_call_input.done", item_id: itemId, output_index: mapping.outputIndex, name: info?.name ?? "", input: customInput, sequence_number: this.nextSeq() }
+            : { type: "response.function_call_arguments.done", item_id: itemId, output_index: mapping.outputIndex, name: info?.name ?? "", arguments: acc, sequence_number: this.nextSeq() },
+        );
         out.push({ type: "response.output_item.done", output_index: mapping.outputIndex, item: fcItem, sequence_number: this.nextSeq() });
         break;
       }
@@ -731,6 +765,11 @@ export class AnthropicStreamEmitter implements StreamEmitter {
   private blockTypes = new Map<number, string>();
   private blockIndex = 0;
   private normalizedToAnthropicIndex = new Map<number, number>();
+  private toolKinds = new Map<number, "function" | "custom">();
+
+  private encodeCustomToolDelta(delta: string): string {
+    return JSON.stringify(delta).slice(1, -1);
+  }
 
   private getBlockIndex(normalizedIndex: number): number {
     if (!this.normalizedToAnthropicIndex.has(normalizedIndex)) {
@@ -810,20 +849,31 @@ export class AnthropicStreamEmitter implements StreamEmitter {
       case "tool_start": {
         const idx = this.getBlockIndex(event.index);
         this.blockTypes.set(event.index, "tool_use");
+        this.toolKinds.set(event.index, event.kind);
         out.push({ type: "content_block_start", index: idx, content_block: { type: "tool_use", id: event.id, name: event.name, input: {} } });
+        if (event.kind === "custom") {
+          out.push({ type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: "{\"content\":\"" } });
+        }
         break;
       }
 
       case "tool_delta": {
         const idx = this.normalizedToAnthropicIndex.get(event.index);
         if (idx == null) break;
-        out.push({ type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: event.delta } });
+        out.push({
+          type: "content_block_delta",
+          index: idx,
+          delta: { type: "input_json_delta", partial_json: this.toolKinds.get(event.index) === "custom" ? this.encodeCustomToolDelta(event.delta) : event.delta },
+        });
         break;
       }
 
       case "tool_done": {
         const idx = this.normalizedToAnthropicIndex.get(event.index);
         if (idx == null) break;
+        if (this.toolKinds.get(event.index) === "custom") {
+          out.push({ type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: "\"}" } });
+        }
         out.push({ type: "content_block_stop", index: idx });
         break;
       }

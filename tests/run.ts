@@ -10,15 +10,18 @@ import {
   anthropicMessageToChatCompletion,
   anthropicMessageToResponsesResponse,
   createSSEConverter,
+  chatCompletionToResponsesResponse,
   chatCompletionToAnthropicMessage,
   chatParamsToAnthropicMessageRequest,
   chatParamsToResponsesRequest,
   responsesRequestToAnthropicMessageRequest,
   responsesRequestToChatParams,
+  responsesResponseToAnthropicMessage,
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
 import { getPublicModelNames, loadConfig, resolveFallbackModels } from "../src/config.js";
 import { sortFallbackGroupMembers } from "../src/fallback.js";
+import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
 import { passthroughRequest, passthroughStreamRequest } from "../src/proxy.js";
 import { renderRecordPage } from "../src/record-page.js";
 import {
@@ -256,6 +259,55 @@ run("responses tool output becomes anthropic tool_result block", () => {
   assert.equal((result.messages[0].content as Array<{ type: string }>)[0].type, "tool_result");
 });
 
+run("responses anthropic conversion makes tool_use and tool_result adjacent", () => {
+  const result = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-5",
+    input: [
+      { type: "custom_tool_call", call_id: "call_custom", name: "apply_patch", input: "*** Begin Patch\n*** End Patch\n" },
+      {
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: "intermediate note",
+          },
+        ],
+      },
+      { type: "custom_tool_call_output", call_id: "call_custom", output: "ok" },
+    ],
+  } as any);
+
+  assert.equal(result.messages[0].role, "assistant");
+  assert.equal(((result.messages[0].content ?? []) as Array<{ type: string }>)[0].type, "tool_use");
+  assert.equal(result.messages[1].role, "user");
+  assert.equal(((result.messages[1].content ?? []) as Array<{ type: string }>)[0].type, "tool_result");
+  assert.equal(result.messages[2].role, "assistant");
+  assert.equal(((result.messages[2].content ?? []) as Array<{ type: string; text?: string }>)[0].type, "text");
+  assert.equal(((result.messages[2].content ?? []) as Array<{ type: string; text?: string }>)[0].text, "intermediate note");
+  assert.equal(result.messages[3].role, "user");
+  assert.equal(result.messages[3].content, "go on");
+});
+
+run("responses anthropic conversion appends empty user turn when input ends with assistant", () => {
+  const result = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-5",
+    input: [
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "assistant tail" }],
+      },
+    ],
+  } as any);
+
+  assert.equal(result.messages[0].role, "assistant");
+  assert.equal(((result.messages[0].content ?? []) as Array<{ type: string; text?: string }>)[0].type, "text");
+  assert.equal(((result.messages[0].content ?? []) as Array<{ type: string; text?: string }>)[0].text, "assistant tail");
+  assert.equal(result.messages[1].role, "user");
+  assert.equal(result.messages[1].content, "go on");
+});
+
 run("responses image tool output becomes anthropic image tool_result block", () => {
   const result = responsesRequestToAnthropicMessageRequest({
     model: "gpt-4o-mini",
@@ -372,12 +424,12 @@ run("responses custom tool call input is downgraded to function call with JSON a
   assert.equal(chat.messages[0].role, "assistant");
   assert.equal((chat.messages[0].tool_calls?.[0] as any).type, "function");
   assert.equal((chat.messages[0].tool_calls?.[0] as any).function.name, "apply_patch");
-  assert.equal((chat.messages[0].tool_calls?.[0] as any).function.arguments, "{\"arg\":\"*** Begin Patch\\n*** End Patch\\n\"}");
+  assert.equal((chat.messages[0].tool_calls?.[0] as any).function.arguments, "{\"content\":\"*** Begin Patch\\n*** End Patch\\n\"}");
   assert.equal(chat.messages[1].role, "tool");
   assert.equal((chat.messages[1] as any).tool_call_id, "call_custom");
 });
 
-run("non-function tools are ignored during normalization", () => {
+run("chat custom tools are still ignored during normalization", () => {
   const chatToResponses = chatParamsToResponsesRequest({
     model: "gpt-5",
     messages: [{ role: "user", content: "hello" }],
@@ -389,18 +441,30 @@ run("non-function tools are ignored during normalization", () => {
   } as any);
   assert.equal(chatToResponses.tools?.length ?? 0, 0);
   assert.equal((chatToResponses as any).tool_choice, undefined);
+});
 
+run("responses custom tools are converted to function tools during normalization", () => {
   const responsesToChat = responsesRequestToChatParams({
     model: "gpt-5",
     input: "hello",
     tools: [
-      { type: "custom", name: "apply_patch", description: "patch", format: { type: "grammar" } },
+      { type: "custom", name: "apply_patch", description: "patch", format: { type: "grammar", syntax: "lark", definition: "start: /(.*)/" } },
       { type: "customer", name: "bad_tool", description: "bad", format: { type: "grammar" } },
     ],
     tool_choice: { type: "custom", name: "apply_patch" },
   } as any);
-  assert.equal(responsesToChat.tools?.length ?? 0, 0);
-  assert.equal((responsesToChat as any).tool_choice, undefined);
+  assert.equal(responsesToChat.tools?.length ?? 0, 1);
+  assert.equal((responsesToChat.tools?.[0] as any).type, "function");
+  assert.equal((responsesToChat.tools?.[0] as any).function.name, "apply_patch");
+  assert.deepEqual((responsesToChat.tools?.[0] as any).function.parameters, {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      content: { type: "string", description: "lark grammar:\nstart: /(.*)/"},
+    },
+    required: ["content"],
+  });
+  assert.deepEqual((responsesToChat as any).tool_choice, { type: "function", function: { name: "apply_patch" } });
 });
 
 run("responses custom tool response is downgraded to function tool call", () => {
@@ -419,7 +483,129 @@ run("responses custom tool response is downgraded to function tool call", () => 
   } as any);
 
   assert.equal(result.choices[0].message.tool_calls?.[0].type, "function");
-  assert.equal((result.choices[0].message.tool_calls?.[0] as any).function.arguments, "{\"arg\":\"*** Begin Patch\\n*** End Patch\\n\"}");
+  assert.equal((result.choices[0].message.tool_calls?.[0] as any).function.arguments, "{\"content\":\"*** Begin Patch\\n*** End Patch\\n\"}");
+});
+
+run("responses custom tools round-trip back to custom tool calls in responses output", () => {
+  runWithRequestId("req_custom_roundtrip", () => {
+    responsesRequestToChatParams({
+      model: "gpt-5",
+      input: "hello",
+      tools: [{ type: "custom", name: "apply_patch", description: "patch", format: { type: "grammar" } }],
+      tool_choice: { type: "custom", name: "apply_patch" },
+    } as any);
+
+    const result = chatCompletionToResponsesResponse({
+      id: "chatcmpl_1",
+      object: "chat.completion",
+      created: 1,
+      model: "gpt-5",
+      choices: [
+        {
+          index: 0,
+          finish_reason: "tool_calls",
+          logprobs: null,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_custom",
+                type: "function",
+                function: { name: "apply_patch", arguments: "{\"content\":\"*** Begin Patch\\n*** End Patch\\n\"}" },
+              },
+            ],
+          },
+        },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    } as any);
+
+    assert.equal(result.output[0].type, "custom_tool_call");
+    assert.equal((result.output[0] as any).name, "apply_patch");
+    assert.equal((result.output[0] as any).input, "*** Begin Patch\n*** End Patch\n");
+  });
+});
+
+run("chat stream restores converted custom tools in responses events", () => {
+  runWithRequestId("req_custom_stream", () => {
+    responsesRequestToChatParams({
+      model: "gpt-5",
+      input: "hello",
+      tools: [{ type: "custom", name: "apply_patch", description: "patch", format: { type: "grammar" } }],
+      tool_choice: { type: "custom", name: "apply_patch" },
+    } as any);
+
+    const converter = createSSEConverter("openai-chat", "openai-responses");
+    const chunks = [
+      ...converter.push(
+        [
+          {
+            id: "resp_custom_stream",
+            object: "chat.completion.chunk",
+            created: 1,
+            model: "gpt-5.4",
+            choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+          },
+          {
+            id: "resp_custom_stream",
+            object: "chat.completion.chunk",
+            created: 1,
+            model: "gpt-5.4",
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "call_custom_stream",
+                      type: "function",
+                      function: { name: "apply_patch", arguments: "" },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          },
+          {
+            id: "resp_custom_stream",
+            object: "chat.completion.chunk",
+            created: 1,
+            model: "gpt-5.4",
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      function: { arguments: "{\"content\":\"*** Begin Patch\\n*** End Patch\\n\"}" },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          },
+        ]
+          .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+          .join(""),
+      ),
+      ...converter.flush(),
+    ];
+
+    const events = parseSSEObjects(chunks);
+    const deltaEvent = events.find((event) => event.event === "response.custom_tool_call_input.delta");
+    const completed = events.find((event) => event.event === "response.completed");
+
+    assert.ok(deltaEvent);
+    assert.equal(deltaEvent?.data.delta, "*** Begin Patch\n*** End Patch\n");
+    assert.ok(completed);
+    assert.equal(completed?.data.response.output[0].type, "custom_tool_call");
+    assert.equal(completed?.data.response.output[0].input, "*** Begin Patch\n*** End Patch\n");
+  });
 });
 
 run("chat verbosity survives chat to responses to chat", () => {
@@ -900,6 +1086,27 @@ run("chat parallel_tool_calls false survives anthropic conversion without explic
   assert.equal(chat.parallel_tool_calls, false);
 });
 
+run("anthropic request tools omit strict field", () => {
+  const anthropic = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: "weather?" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "get_weather",
+          description: "Get weather",
+          parameters: { type: "object", properties: { city: { type: "string" } }, additionalProperties: false },
+          strict: true,
+        },
+      },
+    ],
+  });
+
+  assert.equal((anthropic.tools?.[0] as any).strict, undefined);
+  assert.equal(((anthropic.tools?.[0] as any).input_schema ?? {}).additionalProperties, false);
+});
+
 run("anthropic disable_parallel_tool_use becomes responses parallel_tool_calls false", () => {
   const responses = anthropicMessageRequestToResponsesRequest({
     model: "claude-sonnet-4-5",
@@ -942,7 +1149,7 @@ run("chat response round-trip through anthropic preserves tool call name", () =>
   assert.equal((chat.choices[0].message.tool_calls?.[0] as any).function.name, "lookup");
 });
 
-run("anthropic request thinking block is preserved in responses request", () => {
+run("anthropic request thinking block is dropped in responses request", () => {
   const responses = anthropicMessageRequestToResponsesRequest({
     model: "claude-sonnet-4-5",
     max_tokens: 1024,
@@ -965,12 +1172,12 @@ run("anthropic request thinking block is preserved in responses request", () => 
   });
 
   const input = responses.input as Array<{ type: string }>;
-  assert.equal(input[0].type, "reasoning");
-  assert.equal((input[0] as any).content[0].text, "I should call the weather tool.");
-  assert.equal(input[1].type, "message");
+  assert.equal(input.length, 1);
+  assert.equal(input[0].type, "message");
+  assert.equal((input[0] as any).content[0].text, "Let me check.");
 });
 
-run("anthropic response thinking block is preserved in responses response", () => {
+run("anthropic response thinking block is dropped in responses response", () => {
   const responses = anthropicMessageToResponsesResponse({
     id: "msg_thinking",
     type: "message",
@@ -1003,8 +1210,70 @@ run("anthropic response thinking block is preserved in responses response", () =
     },
   } as any);
 
-  assert.equal((responses.output[0] as any).type, "reasoning");
-  assert.equal((responses.output[1] as any).type, "message");
+  assert.equal((responses.output as any[]).length, 1);
+  assert.equal((responses.output[0] as any).type, "message");
+  assert.equal(((responses.output[0] as any).content[0] ?? {}).text, "final answer");
+});
+
+run("responses request reasoning block is dropped in anthropic request", () => {
+  const anthropic = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-5",
+    input: [
+      {
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: "internal summary" }],
+        content: [{ type: "reasoning_text", text: "internal detail" }],
+        encrypted_content: "enc_1",
+      },
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "visible answer" }],
+      },
+    ],
+  } as any);
+
+  assert.equal((anthropic.messages as any[]).length, 2);
+  assert.equal(((anthropic.messages[0] as any).content ?? [])[0].type, "text");
+  assert.equal(((anthropic.messages[0] as any).content ?? [])[0].text, "visible answer");
+  assert.equal((anthropic.messages[1] as any).role, "user");
+  assert.equal((anthropic.messages[1] as any).content, "go on");
+});
+
+run("responses response reasoning block is dropped in anthropic response", () => {
+  const anthropic = responsesResponseToAnthropicMessage({
+    id: "resp_reasoning",
+    object: "response",
+    created_at: 1,
+    status: "completed",
+    error: null,
+    incomplete_details: null,
+    model: "gpt-5",
+    output: [
+      {
+        id: "reasoning_0",
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: "internal summary" }],
+        content: [{ type: "reasoning_text", text: "internal detail" }],
+        encrypted_content: "enc_1",
+        status: "completed",
+      },
+      {
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "visible answer", annotations: [] }],
+      },
+    ],
+    tools: [],
+    parallel_tool_calls: false,
+    text: { format: { type: "text" } },
+  } as any);
+
+  assert.equal((anthropic.content as any[]).length, 1);
+  assert.equal((anthropic.content[0] as any).type, "text");
+  assert.equal((anthropic.content[0] as any).text, "visible answer");
 });
 
 run("anthropic response usage total includes cache read and write when converted to responses", () => {
@@ -1199,7 +1468,7 @@ fallback:
   }
 }, "Duplicate public model name 'alpha'");
 
-run("fallback group members are ordered by recent failure count minus two, then original order", () => {
+run("fallback group members prefer lower recent failure counts, then original order", () => {
   const ordered = sortFallbackGroupMembers(["alpha", "beta", "gamma", "delta"], (name) => {
     switch (name) {
       case "alpha":
@@ -1215,7 +1484,7 @@ run("fallback group members are ordered by recent failure count minus two, then 
     }
   });
 
-  assert.deepEqual(ordered, ["beta", "gamma", "alpha", "delta"]);
+  assert.deepEqual(ordered, ["delta", "alpha", "beta", "gamma"]);
 });
 
 runThrows("config rejects invalid ttfb_timeout values", () => {
@@ -1432,9 +1701,52 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /Request Record/);
   assert.match(html, /fetch\("\/record\/summary"/);
   assert.match(html, /createValueNode/);
+  assert.match(html, /createCollapsibleSection/);
+  assert.match(html, /createStringNode/);
+  assert.match(html, /parseStreamEvents/);
+  assert.match(html, /renderStreamBody/);
+  assert.match(html, /setInterval\(\(\) =>/);
+  assert.match(html, /fetch\("\/record\/summary"/);
   assert.match(html, /normalizeRequestIdInput/);
+  assert.match(html, /id="record-panel"/);
+  assert.match(html, /class="panel recording"/);
+  assert.match(html, /\.panel::before/);
+  assert.match(html, /repeating-linear-gradient\(90deg, var\(--recording\) 0 8px, transparent 8px 14px\)/);
+  assert.match(html, /record-border-crawl/);
+  assert.match(html, /background-position:/);
+  assert.doesNotMatch(html, /recording-border/);
+  assert.match(html, /classList\.toggle\("recording", summary\.enabled === true\)/);
+  assert.match(html, /list="request-id-options"/);
+  assert.match(html, /placeholder="例如 6dfae2"/);
+  assert.match(html, /grid-template-columns: 1fr/);
   assert.match(html, /recent-key/);
+  assert.match(html, /recent-more/);
+  assert.match(html, /slice\(0, 10\)/);
   assert.match(html, /开始采样/);
+});
+
+run("http log level only keeps /v1 lifecycle logs at info", () => {
+  assert.equal(getHTTPLogLevel("/v1/chat/completions"), "info");
+  assert.equal(getHTTPLogLevel("/v1/models"), "info");
+  assert.equal(getHTTPLogLevel("/record"), "debug");
+  assert.equal(getHTTPLogLevel("/status"), "debug");
+});
+
+run("debug logs are hidden by default and can be enabled with LOG_LEVEL=debug", () => {
+  const original = process.env.LOG_LEVEL;
+  delete process.env.LOG_LEVEL;
+  assert.equal(shouldEmitLog("debug"), false);
+  assert.equal(shouldEmitLog("info"), true);
+
+  process.env.LOG_LEVEL = "debug";
+  assert.equal(shouldEmitLog("debug"), true);
+  assert.equal(shouldEmitLog("info"), true);
+
+  if (original == null) {
+    delete process.env.LOG_LEVEL;
+  } else {
+    process.env.LOG_LEVEL = original;
+  }
 });
 
 await runAsync("passthrough request records upstream request and response", async () => {

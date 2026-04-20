@@ -13,6 +13,7 @@ import { sortFallbackGroupMembers } from "./src/fallback.js";
 import { StatusStore } from "./src/status.js";
 import { renderStatusPage } from "./src/status-page.js";
 import { renderRecordPage } from "./src/record-page.js";
+import { getHTTPLogLevel, shouldEmitLog } from "./src/http-log.js";
 import {
   normalizeOpenAIChatRequest,
   normalizeOpenAIResponsesRequest,
@@ -79,17 +80,22 @@ const app = new Hono();
 app.use("*", async (c, next) => {
   const requestId = createRequestId();
   const started = Date.now();
+  const logLevel = getHTTPLogLevel(c.req.path);
+  const emitLog = (message: string) => {
+    if (!shouldEmitLog(logLevel)) return;
+    console.log(message);
+  };
 
   await runWithRequestId(requestId, async () => {
-    console.log(withRequestId(`[HTTP START] method=${c.req.method} path=${c.req.path}`));
+    emitLog(withRequestId(`[HTTP START] method=${c.req.method} path=${c.req.path}`));
 
     try {
       await next();
       const responseType = c.res.headers.get("content-type") ?? "";
       if (responseType.includes("text/event-stream")) {
-        console.log(withRequestId(`[HTTP STREAM START] method=${c.req.method} path=${c.req.path} status=${c.res.status} duration=${Date.now() - started}ms`));
+        emitLog(withRequestId(`[HTTP STREAM START] method=${c.req.method} path=${c.req.path} status=${c.res.status} duration=${Date.now() - started}ms`));
       } else {
-        console.log(withRequestId(`[HTTP END] method=${c.req.method} path=${c.req.path} status=${c.res.status} duration=${Date.now() - started}ms`));
+        emitLog(withRequestId(`[HTTP END] method=${c.req.method} path=${c.req.path} status=${c.res.status} duration=${Date.now() - started}ms`));
       }
     } catch (error) {
       console.error(orange(withRequestId(`[HTTP ERROR] method=${c.req.method} path=${c.req.path} duration=${Date.now() - started}ms`)), error);
@@ -434,13 +440,19 @@ function buildStreamReadable(
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const started = Date.now();
+  let cancelled = false;
+  let finished = false;
+  let cancelPromise: Promise<void> | undefined;
 
   return new ReadableStream({
     async pull(controller) {
+      if (finished) return;
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) {
+            finished = true;
+            if (cancelled) return;
             for (const chunk of converter.flush()) {
               const outboundText = typeof chunk === "string" ? chunk : decoder.decode(chunk);
               appendRecordedClientResponseBody({ chunk: outboundText });
@@ -457,20 +469,28 @@ function buildStreamReadable(
           appendRecordedAttemptResponseBody({ index: attemptIndex, chunk: text });
           usageCollector.push(text);
           for (const chunk of converter.push(text)) {
+            if (cancelled) return;
             const outboundText = typeof chunk === "string" ? chunk : decoder.decode(chunk);
             appendRecordedClientResponseBody({ chunk: outboundText });
             controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
           }
         }
       } catch (error) {
+        finished = true;
+        if (cancelled) return;
         statusStore.recordFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
         console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
         controller.error(error);
       }
     },
-    cancel() {
+    cancel(reason) {
+      if (cancelled || finished) return cancelPromise;
+      cancelled = true;
       console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`));
-      reader.releaseLock();
+      cancelPromise = reader.cancel(reason).catch((error) => {
+        console.warn(withRequestId(`[HTTP STREAM CANCEL ERROR] path=${path} duration=${Date.now() - started}ms`), error);
+      });
+      return cancelPromise;
     },
   });
 }
@@ -495,6 +515,9 @@ function buildPipeStreamAndCache(
   const outputItems: unknown[] = [];
   const encoder = new TextEncoder();
   const started = Date.now();
+  let cancelled = false;
+  let finished = false;
+  let cancelPromise: Promise<void> | undefined;
 
   function collectItems(sseText: string) {
     for (const { data } of collector.push(sseText)) {
@@ -509,10 +532,13 @@ function buildPipeStreamAndCache(
 
   return new ReadableStream({
     async pull(controller) {
+      if (finished) return;
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) {
+            finished = true;
+            if (cancelled) return;
             if (converter) {
               for (const chunk of converter.flush()) {
                 const outboundText = typeof chunk === "string" ? chunk : decoder.decode(chunk);
@@ -542,26 +568,35 @@ function buildPipeStreamAndCache(
           usageCollector.push(text);
           if (converter) {
             for (const chunk of converter.push(text)) {
+              if (cancelled) return;
               const outboundText = typeof chunk === "string" ? chunk : decoder.decode(chunk);
               collectItems(outboundText);
               appendRecordedClientResponseBody({ chunk: outboundText });
               controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
             }
           } else {
+            if (cancelled) return;
             collectItems(text);
             appendRecordedClientResponseBody({ chunk: text });
             controller.enqueue(value);
           }
         }
       } catch (error) {
+        finished = true;
+        if (cancelled) return;
         statusStore.recordFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
         console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
         controller.error(error);
       }
     },
-    cancel() {
+    cancel(reason) {
+      if (cancelled || finished) return cancelPromise;
+      cancelled = true;
       console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`));
-      reader.releaseLock();
+      cancelPromise = reader.cancel(reason).catch((error) => {
+        console.warn(withRequestId(`[HTTP STREAM CANCEL ERROR] path=${path} duration=${Date.now() - started}ms`), error);
+      });
+      return cancelPromise;
     },
   });
 }

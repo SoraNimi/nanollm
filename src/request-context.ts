@@ -1,7 +1,12 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 
-const requestContext = new AsyncLocalStorage<{ requestId: string }>();
+interface RequestContextStore {
+  requestId: string;
+  responsesCustomToolNames: Set<string>;
+}
+
+const requestContext = new AsyncLocalStorage<RequestContextStore>();
 
 function formatTimestamp(date = new Date()): string {
   const year = date.getFullYear();
@@ -20,11 +25,19 @@ export function createRequestId(): string {
 }
 
 export function runWithRequestId<T>(requestId: string, callback: () => T): T {
-  return requestContext.run({ requestId }, callback);
+  return requestContext.run({ requestId, responsesCustomToolNames: new Set<string>() }, callback);
 }
 
 export function getRequestId(): string | undefined {
   return requestContext.getStore()?.requestId;
+}
+
+export function markResponsesCustomToolName(name: string): void {
+  requestContext.getStore()?.responsesCustomToolNames.add(name);
+}
+
+export function isResponsesCustomToolName(name: string): boolean {
+  return requestContext.getStore()?.responsesCustomToolNames.has(name) ?? false;
 }
 
 export function withRequestId(message: string): string {

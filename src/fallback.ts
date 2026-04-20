@@ -5,6 +5,6 @@ export function sortFallbackGroupMembers(
   return [...members].sort((left, right) => {
     const leftScore = getFailureCount(left) - 2;
     const rightScore = getFailureCount(right) - 2;
-    return rightScore - leftScore;
+    return leftScore - rightScore;
   });
 }

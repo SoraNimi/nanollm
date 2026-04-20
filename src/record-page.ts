@@ -5,6 +5,11 @@ function serializeForScript(value: unknown): string {
     .replaceAll("&", "\\u0026");
 }
 
+const REQUEST_ID_DATALIST_ID = "request-id-options";
+const STRING_PREVIEW_LENGTH = 100;
+const SUMMARY_POLL_INTERVAL_MS = 3000;
+const RECENT_REQUEST_LIMIT = 10;
+
 export function renderRecordPage(summary: {
   enabled: boolean;
   capturedCount: number;
@@ -24,6 +29,8 @@ export function renderRecordPage(summary: {
         --bg: #f2efe7;
         --panel: rgba(255, 252, 247, 0.95);
         --border: #d8cfc1;
+        --recording: #2cab63;
+        --recording-soft: rgba(44, 171, 99, 0.2);
         --text: #2f271d;
         --muted: #736553;
         --accent: #8c5a2f;
@@ -46,11 +53,55 @@ export function renderRecordPage(summary: {
         padding: 24px;
       }
       .panel {
+        position: relative;
+        isolation: isolate;
         background: var(--panel);
         border: 1px solid var(--border);
         border-radius: 20px;
         padding: 20px;
         box-shadow: var(--shadow);
+      }
+      .panel::before {
+        content: "";
+        position: absolute;
+        inset: -1px;
+        border-radius: inherit;
+        padding: 2px;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 180ms ease;
+        background:
+          repeating-linear-gradient(90deg, var(--recording) 0 8px, transparent 8px 14px) 0 0 / 100% 2px no-repeat,
+          repeating-linear-gradient(180deg, var(--recording) 0 8px, transparent 8px 14px) 100% 0 / 2px 100% no-repeat,
+          repeating-linear-gradient(270deg, var(--recording) 0 8px, transparent 8px 14px) 0 100% / 100% 2px no-repeat,
+          repeating-linear-gradient(0deg, var(--recording) 0 8px, transparent 8px 14px) 0 0 / 2px 100% no-repeat;
+        -webkit-mask:
+          linear-gradient(#000 0 0) content-box,
+          linear-gradient(#000 0 0);
+        -webkit-mask-composite: xor;
+        mask:
+          linear-gradient(#000 0 0) content-box,
+          linear-gradient(#000 0 0);
+        mask-composite: exclude;
+      }
+      .panel.recording {
+        border-color: transparent;
+        box-shadow:
+          var(--shadow),
+          0 0 0 1px var(--recording-soft);
+      }
+      .panel.recording::before {
+        opacity: 1;
+        animation: record-border-crawl 1.25s linear infinite;
+      }
+      @keyframes record-border-crawl {
+        to {
+          background-position:
+            14px 0,
+            100% 14px,
+            -14px 100%,
+            0 -14px;
+        }
       }
       h1, h2, h3 {
         margin: 0;
@@ -158,11 +209,62 @@ export function renderRecordPage(summary: {
         font-size: 11px;
         margin-top: 3px;
       }
+      .recent-more {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 44px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px dashed rgba(140, 90, 47, 0.24);
+        color: var(--muted);
+        background: rgba(255, 250, 242, 0.7);
+        font-weight: 700;
+      }
       .section {
         border: 1px solid rgba(216, 207, 193, 0.82);
         border-radius: 16px;
         padding: 16px;
         background: rgba(255, 255, 255, 0.58);
+      }
+      details.section {
+        padding: 0;
+        overflow: hidden;
+      }
+      details.section > summary,
+      .fold > summary,
+      .json-tree details > summary,
+      .inline-fold > summary {
+        cursor: pointer;
+      }
+      details.section > summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 16px;
+        list-style: none;
+      }
+      details.section > summary::-webkit-details-marker,
+      .fold > summary::-webkit-details-marker,
+      .inline-fold > summary::-webkit-details-marker {
+        display: none;
+      }
+      details.section > summary::after {
+        content: "展开";
+        color: var(--accent);
+        font-size: 12px;
+        font-weight: 700;
+      }
+      details.section[open] > summary::after {
+        content: "收起";
+      }
+      .section-body {
+        padding: 0 16px 16px;
+      }
+      .section-title {
+        font-size: 18px;
+        font-weight: 700;
       }
       .kv {
         display: grid;
@@ -187,23 +289,68 @@ export function renderRecordPage(summary: {
         padding: 14px;
         background: rgba(255, 251, 245, 0.78);
       }
+      .attempt-head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px 12px;
+        margin-bottom: 8px;
+      }
       .subgrid {
         display: grid;
         gap: 12px;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: 1fr;
       }
       .box {
+        position: relative;
         border: 1px solid rgba(216, 207, 193, 0.82);
         border-radius: 12px;
         padding: 12px;
         background: #fffdfa;
         min-width: 0;
       }
+      .copy-btn {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        padding: 6px 10px;
+        border-radius: 10px;
+        font-size: 12px;
+        line-height: 1;
+      }
+      .fold {
+        border: 1px solid rgba(216, 207, 193, 0.82);
+        border-radius: 12px;
+        background: #fffdfa;
+      }
+      .fold + .fold {
+        margin-top: 12px;
+      }
+      .fold > summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px;
+        list-style: none;
+        color: var(--accent);
+        font-weight: 700;
+      }
+      .fold > summary::after {
+        content: "展开";
+        font-size: 12px;
+      }
+      .fold[open] > summary::after {
+        content: "收起";
+      }
+      .fold-body {
+        padding: 0 12px 12px;
+      }
       .json-tree details {
         margin-left: 14px;
       }
       .json-tree summary {
-        cursor: pointer;
         color: var(--accent);
       }
       .json-tree .entry {
@@ -224,6 +371,38 @@ export function renderRecordPage(summary: {
       .json-tree .null {
         color: #8c3d8c;
       }
+      .inline-fold {
+        display: inline-block;
+        vertical-align: top;
+        max-width: 100%;
+      }
+      .inline-fold > summary {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        list-style: none;
+      }
+      .inline-fold > summary::after {
+        content: "展开";
+        color: var(--accent);
+        font-size: 12px;
+      }
+      .inline-fold[open] > summary::after {
+        content: "收起";
+      }
+      .inline-meta {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .stream-list {
+        display: grid;
+        gap: 10px;
+      }
+      .stream-meta {
+        margin-bottom: 8px;
+        color: var(--muted);
+        font-size: 12px;
+      }
       pre {
         margin: 0;
         white-space: pre-wrap;
@@ -240,9 +419,6 @@ export function renderRecordPage(summary: {
         .toolbar {
           grid-template-columns: 1fr;
         }
-        .subgrid {
-          grid-template-columns: 1fr;
-        }
         .kv {
           grid-template-columns: 1fr;
         }
@@ -251,13 +427,14 @@ export function renderRecordPage(summary: {
   </head>
   <body>
     <main class="page">
-      <section class="panel">
+      <section class="panel${summary.enabled ? " recording" : ""}" id="record-panel">
         <h1>Request Record</h1>
         <p class="meta">输入完整 requestId 或前 6 位，页面会调用查询接口并展示本轮采样缓存里的请求详情。</p>
         <div class="toolbar">
           <div>
             <label for="request-id">requestId</label>
-            <input id="request-id" name="requestId" placeholder="例如 6dfae2a6-888c-4b1d-942f-9c56143f61bb 或 6dfae2" />
+            <input id="request-id" name="requestId" list="${REQUEST_ID_DATALIST_ID}" placeholder="例如 6dfae2" />
+            <datalist id="${REQUEST_ID_DATALIST_ID}"></datalist>
           </div>
           <div class="actions">
             <button id="query-button" type="button">查询</button>
@@ -277,17 +454,43 @@ export function renderRecordPage(summary: {
       const summaryEl = document.getElementById("summary");
       const recentEl = document.getElementById("recent");
       const contentEl = document.getElementById("content");
+      const recordPanelEl = document.getElementById("record-panel");
       const requestIdInput = document.getElementById("request-id");
+      const requestIdOptionsEl = document.getElementById("${REQUEST_ID_DATALIST_ID}");
 
       function normalizeRequestIdInput(value) {
         return value
           .trim()
           .replace(/^.*requestId=/i, "")
-          .replace(/^[\\[\\("'\s]+/, "")
-          .replace(/[\\]\\)"'\s,]+$/, "");
+          .replace(/^[\\[\\("'\\s]+/, "")
+          .replace(/[\\]\\)"'\\s,]+$/, "");
+      }
+
+      function setRequestIdOptions(summary) {
+        requestIdOptionsEl.textContent = "";
+        if (!summary.recentKeys || summary.recentKeys.length === 0) {
+          return;
+        }
+
+        const seen = new Set();
+        summary.recentKeys.forEach((item) => {
+          if (seen.has(item.requestId)) return;
+          seen.add(item.requestId);
+          const option = document.createElement("option");
+          option.value = item.requestId;
+          option.label =
+            item.key +
+            " · " +
+            item.path +
+            " · " +
+            new Date(item.createdAt).toLocaleTimeString("zh-CN");
+          requestIdOptionsEl.appendChild(option);
+        });
       }
 
       function setSummary(summary) {
+        setRequestIdOptions(summary);
+        recordPanelEl.classList.toggle("recording", summary.enabled === true);
         summaryEl.textContent = "";
         const items = [
           ["采样状态", summary.enabled ? "开启" : "关闭"],
@@ -306,7 +509,7 @@ export function renderRecordPage(summary: {
         if (!summary.recentKeys || summary.recentKeys.length === 0) {
           return;
         }
-        summary.recentKeys.forEach((item) => {
+        summary.recentKeys.slice(0, ${RECENT_REQUEST_LIMIT}).forEach((item) => {
           const button = document.createElement("button");
           button.type = "button";
           button.className = "recent-key";
@@ -323,6 +526,12 @@ export function renderRecordPage(summary: {
           });
           recentEl.appendChild(button);
         });
+        if (summary.recentKeys.length > ${RECENT_REQUEST_LIMIT}) {
+          const more = document.createElement("div");
+          more.className = "recent-more";
+          more.textContent = "...";
+          recentEl.appendChild(more);
+        }
       }
 
       function createSection(title) {
@@ -332,6 +541,41 @@ export function renderRecordPage(summary: {
         heading.textContent = title;
         section.appendChild(heading);
         return section;
+      }
+
+      function createCollapsibleSection(title, open = false) {
+        const section = document.createElement("details");
+        section.className = "section";
+        section.open = open;
+
+        const summary = document.createElement("summary");
+        const heading = document.createElement("span");
+        heading.className = "section-title";
+        heading.textContent = title;
+        summary.appendChild(heading);
+        section.appendChild(summary);
+
+        const body = document.createElement("div");
+        body.className = "section-body";
+        section.appendChild(body);
+
+        return { section, body };
+      }
+
+      function createFold(title, open = false) {
+        const fold = document.createElement("details");
+        fold.className = "fold";
+        fold.open = open;
+
+        const summary = document.createElement("summary");
+        summary.textContent = title;
+        fold.appendChild(summary);
+
+        const body = document.createElement("div");
+        body.className = "fold-body";
+        fold.appendChild(body);
+
+        return { fold, body };
       }
 
       function appendKV(section, pairs) {
@@ -348,7 +592,42 @@ export function renderRecordPage(summary: {
         section.appendChild(dl);
       }
 
-      function createValueNode(value, depth = 0) {
+      function createStringNode(value) {
+        const quoted = JSON.stringify(value);
+        if (value.length <= ${STRING_PREVIEW_LENGTH}) {
+          const span = document.createElement("span");
+          span.className = "string";
+          span.textContent = quoted;
+          return span;
+        }
+
+        const details = document.createElement("details");
+        details.className = "inline-fold";
+
+        const summary = document.createElement("summary");
+        const preview = document.createElement("span");
+        preview.className = "string";
+        preview.textContent = JSON.stringify(value.slice(0, ${STRING_PREVIEW_LENGTH}) + "…");
+        const meta = document.createElement("span");
+        meta.className = "inline-meta";
+        meta.textContent = value.length + " chars";
+        summary.appendChild(preview);
+        summary.appendChild(meta);
+        details.appendChild(summary);
+
+        const body = document.createElement("div");
+        body.className = "entry";
+        const full = document.createElement("span");
+        full.className = "string";
+        full.textContent = quoted;
+        body.appendChild(full);
+        details.appendChild(body);
+
+        return details;
+      }
+
+      function createValueNode(value, options) {
+        const expanded = options?.expanded === true;
         if (value === null) {
           const span = document.createElement("span");
           span.className = "null";
@@ -358,7 +637,7 @@ export function renderRecordPage(summary: {
 
         if (Array.isArray(value)) {
           const details = document.createElement("details");
-          details.open = depth < 1;
+          details.open = expanded;
           const summary = document.createElement("summary");
           summary.textContent = "Array(" + value.length + ")";
           details.appendChild(summary);
@@ -370,7 +649,7 @@ export function renderRecordPage(summary: {
             key.className = "key";
             key.textContent = index + ": ";
             entry.appendChild(key);
-            entry.appendChild(createValueNode(item, depth + 1));
+            entry.appendChild(createValueNode(item, options));
             body.appendChild(entry);
           });
           details.appendChild(body);
@@ -380,7 +659,7 @@ export function renderRecordPage(summary: {
         if (typeof value === "object") {
           const entries = Object.entries(value);
           const details = document.createElement("details");
-          details.open = depth < 1;
+          details.open = expanded;
           const summary = document.createElement("summary");
           summary.textContent = "Object{" + entries.length + "}";
           details.appendChild(summary);
@@ -392,7 +671,7 @@ export function renderRecordPage(summary: {
             key.className = "key";
             key.textContent = keyName + ": ";
             entry.appendChild(key);
-            entry.appendChild(createValueNode(childValue, depth + 1));
+            entry.appendChild(createValueNode(childValue, options));
             body.appendChild(entry);
           }
           details.appendChild(body);
@@ -401,9 +680,7 @@ export function renderRecordPage(summary: {
 
         const span = document.createElement("span");
         if (typeof value === "string") {
-          span.className = "string";
-          span.textContent = JSON.stringify(value);
-          return span;
+          return createStringNode(value);
         }
         if (typeof value === "number") {
           span.className = "number";
@@ -419,17 +696,369 @@ export function renderRecordPage(summary: {
         return span;
       }
 
-      function appendBodyBox(parent, title, value) {
-        const box = document.createElement("div");
-        box.className = "box";
-        const heading = document.createElement("h3");
-        heading.textContent = title;
-        box.appendChild(heading);
+      function parseStreamEvents(text) {
+        const normalized = text.replaceAll("\\r\\n", "\\n");
+        if (!/(^|\\n)(data|event|id|retry):/.test(normalized)) {
+          return null;
+        }
+
+        const blocks = normalized.split(/\\n\\n+/);
+        const events = [];
+        for (const block of blocks) {
+          if (!block.trim()) continue;
+          const lines = block.split("\\n");
+          let eventName;
+          let sawField = false;
+          const dataLines = [];
+          for (const line of lines) {
+            if (!line) continue;
+            if (line.startsWith(":")) {
+              sawField = true;
+              continue;
+            }
+            if (line.startsWith("event:")) {
+              eventName = line.slice("event:".length).trimStart();
+              sawField = true;
+              continue;
+            }
+            if (line.startsWith("data:")) {
+              dataLines.push(line.slice("data:".length).trimStart());
+              sawField = true;
+              continue;
+            }
+            if (line.startsWith("id:") || line.startsWith("retry:")) {
+              sawField = true;
+              continue;
+            }
+          }
+          if (!sawField) {
+            return null;
+          }
+          const data = dataLines.join("\\n");
+          let parsed;
+          if (data && data !== "[DONE]") {
+            try {
+              parsed = JSON.parse(data);
+            } catch {}
+          }
+          events.push({ event: eventName, data, parsed });
+        }
+        return events;
+      }
+
+      function getStreamEventLabel(item, index) {
+        if (item.event) return "#" + index + " " + item.event;
+        if (item.data === "[DONE]") return "#" + index + " [DONE]";
+        if (item.parsed && typeof item.parsed === "object" && typeof item.parsed.type === "string") {
+          return "#" + index + " " + item.parsed.type;
+        }
+        return "#" + index + " data";
+      }
+
+      function reconstructStreamResponse(events) {
+        return (
+          reconstructOpenAIResponsesStream(events) ??
+          reconstructOpenAIChatStream(events) ??
+          reconstructAnthropicStream(events)
+        );
+      }
+
+      function reconstructOpenAIResponsesStream(events) {
+        let lastResponse = null;
+        let sawResponsesEvent = false;
+        for (const item of events) {
+          const payload = item.parsed;
+          if (!payload || typeof payload !== "object") continue;
+          const type = item.event || payload.type;
+          if (typeof type !== "string" || !type.startsWith("response.")) continue;
+          sawResponsesEvent = true;
+          if (payload.response && typeof payload.response === "object") {
+            lastResponse = payload.response;
+          }
+          if (type === "response.completed" && payload.response) {
+            return payload.response;
+          }
+        }
+        return sawResponsesEvent ? lastResponse : null;
+      }
+
+      function reconstructOpenAIChatStream(events) {
+        let state = null;
+        const toolCallMap = new Map();
+        let textContent = "";
+        let refusalContent = "";
+        let sawChatChunk = false;
+
+        for (const item of events) {
+          const payload = item.parsed;
+          if (!payload || typeof payload !== "object" || payload.object !== "chat.completion.chunk") continue;
+          sawChatChunk = true;
+          if (!state) {
+            state = {
+              id: payload.id,
+              created: payload.created,
+              model: payload.model,
+              finishReason: null,
+              usage: null,
+            };
+          }
+          if (payload.usage) {
+            state.usage = payload.usage;
+          }
+          const choice = Array.isArray(payload.choices) ? payload.choices[0] : null;
+          if (!choice) continue;
+          if (choice.finish_reason != null) {
+            state.finishReason = choice.finish_reason;
+          }
+          const delta = choice.delta ?? {};
+          if (typeof delta.content === "string" && delta.content) {
+            textContent += delta.content;
+          }
+          if (typeof delta.refusal === "string" && delta.refusal) {
+            refusalContent += delta.refusal;
+          }
+          if (Array.isArray(delta.tool_calls)) {
+            delta.tool_calls.forEach((toolCall) => {
+              const index = Number.isFinite(toolCall.index) ? toolCall.index : 0;
+              let entry = toolCallMap.get(index);
+              if (!entry) {
+                entry = {
+                  id: toolCall.id || "call_" + index,
+                  type: "function",
+                  function: {
+                    name: toolCall.function?.name || "",
+                    arguments: "",
+                  },
+                };
+                toolCallMap.set(index, entry);
+              }
+              if (toolCall.id) entry.id = toolCall.id;
+              if (toolCall.function?.name) entry.function.name = toolCall.function.name;
+              if (toolCall.function?.arguments) entry.function.arguments += toolCall.function.arguments;
+            });
+          }
+        }
+
+        if (!sawChatChunk || !state) return null;
+
+        const message = {
+          role: "assistant",
+          content: null,
+          refusal: refusalContent || null,
+        };
+        if (textContent && refusalContent) {
+          message.content = [
+            { type: "text", text: textContent },
+            { type: "refusal", refusal: refusalContent },
+          ];
+        } else if (refusalContent) {
+          message.content = [{ type: "refusal", refusal: refusalContent }];
+        } else if (textContent) {
+          message.content = textContent;
+        }
+
+        const toolCalls = [...toolCallMap.entries()]
+          .sort((left, right) => left[0] - right[0])
+          .map(([, value]) => value);
+        if (toolCalls.length > 0) {
+          message.tool_calls = toolCalls;
+        }
+
+        return {
+          id: state.id,
+          object: "chat.completion",
+          created: state.created,
+          model: state.model,
+          choices: [
+            {
+              index: 0,
+              message,
+              finish_reason: state.finishReason ?? (toolCalls.length > 0 ? "tool_calls" : "stop"),
+              logprobs: null,
+            },
+          ],
+          usage: state.usage,
+        };
+      }
+
+      function reconstructAnthropicStream(events) {
+        let response = null;
+        let sawAnthropicEvent = false;
+        const toolInputBuffers = new Map();
+
+        function finalizeToolUse(index) {
+          const block = response?.content?.[index];
+          if (!block || block.type !== "tool_use") return;
+          const partial = toolInputBuffers.get(index);
+          if (!partial) {
+            block.input = block.input && typeof block.input === "object" ? block.input : {};
+            return;
+          }
+          try {
+            block.input = JSON.parse(partial);
+          } catch {
+            block.input = { raw: partial };
+          }
+        }
+
+        for (const item of events) {
+          const payload = item.parsed;
+          if (!payload || typeof payload !== "object" || typeof payload.type !== "string") continue;
+          const type = payload.type;
+          if (!["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"].includes(type)) continue;
+          sawAnthropicEvent = true;
+
+          if (type === "message_start" && payload.message && typeof payload.message === "object") {
+            response = JSON.parse(JSON.stringify(payload.message));
+            if (!Array.isArray(response.content)) response.content = [];
+            continue;
+          }
+
+          if (!response) continue;
+
+          if (type === "content_block_start") {
+            const index = payload.index;
+            const block = payload.content_block ?? {};
+            if (block.type === "text") {
+              response.content[index] = { type: "text", text: block.text ?? "", citations: block.citations ?? null };
+            } else if (block.type === "thinking") {
+              response.content[index] = { type: "thinking", thinking: block.thinking ?? "", signature: block.signature ?? "" };
+            } else if (block.type === "redacted_thinking") {
+              response.content[index] = { type: "redacted_thinking", data: block.data ?? "" };
+            } else if (block.type === "tool_use") {
+              response.content[index] = {
+                type: "tool_use",
+                id: block.id,
+                caller: block.caller ?? { type: "direct" },
+                name: block.name,
+                input: {},
+              };
+              toolInputBuffers.set(index, "");
+            }
+            continue;
+          }
+
+          if (type === "content_block_delta") {
+            const index = payload.index;
+            const block = response.content[index];
+            const delta = payload.delta ?? {};
+            if (!block || !delta.type) continue;
+            if (delta.type === "text_delta") {
+              block.text = (block.text ?? "") + (delta.text ?? "");
+            } else if (delta.type === "thinking_delta") {
+              block.thinking = (block.thinking ?? "") + (delta.thinking ?? "");
+            } else if (delta.type === "signature_delta") {
+              block.signature = (block.signature ?? "") + (delta.signature ?? "");
+            } else if (delta.type === "input_json_delta") {
+              toolInputBuffers.set(index, (toolInputBuffers.get(index) ?? "") + (delta.partial_json ?? ""));
+            }
+            continue;
+          }
+
+          if (type === "content_block_stop") {
+            finalizeToolUse(payload.index);
+            continue;
+          }
+
+          if (type === "message_delta") {
+            response.stop_reason = payload.delta?.stop_reason ?? response.stop_reason ?? null;
+            response.stop_sequence = payload.delta?.stop_sequence ?? response.stop_sequence ?? null;
+            if (payload.usage) {
+              response.usage = payload.usage;
+            }
+            continue;
+          }
+
+          if (type === "message_stop") {
+            for (const index of toolInputBuffers.keys()) {
+              finalizeToolUse(index);
+            }
+            return response;
+          }
+        }
+
+        if (!sawAnthropicEvent || !response) return null;
+        for (const index of toolInputBuffers.keys()) {
+          finalizeToolUse(index);
+        }
+        return response;
+      }
+
+      function renderStreamValue(value) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "json-tree";
+        if (value && typeof value === "object") {
+          wrapper.appendChild(createValueNode(value, { expanded: true }));
+        } else if (typeof value === "string") {
+          wrapper.appendChild(createStringNode(value));
+        } else {
+          wrapper.appendChild(createValueNode(value, { expanded: true }));
+        }
+        return wrapper;
+      }
+
+      function renderStreamBody(parent, value) {
+        const events = parseStreamEvents(value);
+        if (!events || events.length === 0) {
+          parent.appendChild(renderStreamValue(value));
+          return;
+        }
+
+        const reconstructed = reconstructStreamResponse(events);
+        if (reconstructed) {
+          const fold = createFold("完整响应");
+          fold.body.appendChild(renderStreamValue(reconstructed));
+          parent.appendChild(fold.fold);
+        }
+
+        const listFold = createFold("流事件");
+        const list = document.createElement("div");
+        list.className = "stream-list";
+        events.forEach((item, index) => {
+          const fold = createFold(getStreamEventLabel(item, index + 1));
+          if (item.event) {
+            const meta = document.createElement("div");
+            meta.className = "stream-meta";
+            meta.textContent = "event: " + item.event;
+            fold.body.appendChild(meta);
+          }
+          fold.body.appendChild(renderStreamValue(item.parsed ?? item.data));
+          list.appendChild(fold.fold);
+        });
+        listFold.body.appendChild(list);
+        parent.appendChild(listFold.fold);
+      }
+
+     function appendBodyBox(parent, title, value, options) {
+       const box = document.createElement("div");
+       box.className = "box";
+       const heading = document.createElement("h3");
+       heading.textContent = title;
+       box.appendChild(heading);
+        if (value != null && value !== "") {
+          const copyBtn = document.createElement("button");
+          copyBtn.type = "button";
+          copyBtn.className = "copy-btn";
+          copyBtn.textContent = "复制";
+          copyBtn.addEventListener("click", () => {
+            const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+            navigator.clipboard.writeText(text).then(() => {
+              copyBtn.textContent = "已复制";
+              setTimeout(() => { copyBtn.textContent = "复制"; }, 1500);
+            }).catch(() => {
+              copyBtn.textContent = "失败";
+              setTimeout(() => { copyBtn.textContent = "复制"; }, 1500);
+            });
+          });
+          box.appendChild(copyBtn);
+        }
         if (value == null || value === "") {
-          const empty = document.createElement("div");
-          empty.className = "empty";
-          empty.textContent = "无内容";
-          box.appendChild(empty);
+         const empty = document.createElement("div");
+         empty.className = "empty";
+         empty.textContent = "无内容";
+         box.appendChild(empty);
+       } else if (options?.streamText === true && typeof value === "string") {
+          renderStreamBody(box, value);
         } else if (typeof value === "string") {
           const pre = document.createElement("pre");
           pre.textContent = value;
@@ -457,13 +1086,13 @@ export function renderRecordPage(summary: {
         ]);
         contentEl.appendChild(baseSection);
 
-        const requestSection = createSection("Client Request");
+        const requestSection = createCollapsibleSection("Client Request");
         const requestGrid = document.createElement("div");
         requestGrid.className = "subgrid";
         appendBodyBox(requestGrid, "Headers", record.clientRequest?.headers);
         appendBodyBox(requestGrid, "Body", record.clientRequest?.body);
-        requestSection.appendChild(requestGrid);
-        contentEl.appendChild(requestSection);
+        requestSection.body.appendChild(requestGrid);
+        contentEl.appendChild(requestSection.section);
 
         const attemptsSection = createSection("Attempts");
         const attemptsStack = document.createElement("div");
@@ -477,41 +1106,54 @@ export function renderRecordPage(summary: {
           record.attempts.forEach((attempt) => {
             const card = document.createElement("div");
             card.className = "attempt";
+            const head = document.createElement("div");
+            head.className = "attempt-head";
             const title = document.createElement("h3");
             title.textContent = "#" + attempt.index + " " + attempt.modelName + " (" + attempt.provider + ")";
-            card.appendChild(title);
+            head.appendChild(title);
+            card.appendChild(head);
             appendKV(card, [
               ["url", attempt.url],
               ["status", attempt.response?.status],
               ["error", attempt.error?.message ?? ""],
             ]);
-            const grid = document.createElement("div");
-            grid.className = "subgrid";
-            appendBodyBox(grid, "Upstream Request Headers", attempt.request?.headers);
-            appendBodyBox(grid, "Upstream Request Body", attempt.request?.body);
-            appendBodyBox(grid, "Upstream Response Headers", attempt.response?.headers);
-            appendBodyBox(grid, "Upstream Response Body", attempt.response?.body);
+
+            const upstreamRequestFold = createFold("Upstream Request");
+            const upstreamRequestGrid = document.createElement("div");
+            upstreamRequestGrid.className = "subgrid";
+            appendBodyBox(upstreamRequestGrid, "Headers", attempt.request?.headers);
+            appendBodyBox(upstreamRequestGrid, "Body", attempt.request?.body);
+            upstreamRequestFold.body.appendChild(upstreamRequestGrid);
+            card.appendChild(upstreamRequestFold.fold);
+
+            const upstreamResponseFold = createFold("Upstream Response");
+            const upstreamResponseGrid = document.createElement("div");
+            upstreamResponseGrid.className = "subgrid";
+            appendBodyBox(upstreamResponseGrid, "Headers", attempt.response?.headers);
+            appendBodyBox(upstreamResponseGrid, "Body", attempt.response?.body, { streamText: record.stream });
             if (attempt.error?.upstream !== undefined) {
-              appendBodyBox(grid, "Upstream Error Body", attempt.error.upstream);
+              appendBodyBox(upstreamResponseGrid, "Upstream Error Body", attempt.error.upstream);
             }
-            card.appendChild(grid);
+            upstreamResponseFold.body.appendChild(upstreamResponseGrid);
+            card.appendChild(upstreamResponseFold.fold);
+
             attemptsStack.appendChild(card);
           });
         }
         attemptsSection.appendChild(attemptsStack);
         contentEl.appendChild(attemptsSection);
 
-        const responseSection = createSection("Client Response");
-        appendKV(responseSection, [
+        const responseSection = createCollapsibleSection("Client Response");
+        appendKV(responseSection.body, [
           ["status", record.clientResponse?.status],
           ["truncated", record.clientResponse?.truncated ? "yes" : "no"],
         ]);
         const responseGrid = document.createElement("div");
         responseGrid.className = "subgrid";
         appendBodyBox(responseGrid, "Headers", record.clientResponse?.headers);
-        appendBodyBox(responseGrid, "Body", record.clientResponse?.body);
-        responseSection.appendChild(responseGrid);
-        contentEl.appendChild(responseSection);
+        appendBodyBox(responseGrid, "Body", record.clientResponse?.body, { streamText: record.stream });
+        responseSection.body.appendChild(responseGrid);
+        contentEl.appendChild(responseSection.section);
       }
 
       function renderError(message) {
@@ -574,6 +1216,9 @@ export function renderRecordPage(summary: {
       });
 
       setSummary(INITIAL_SUMMARY);
+      setInterval(() => {
+        refreshSummary().catch(() => {});
+      }, ${SUMMARY_POLL_INTERVAL_MS});
 
       const params = new URLSearchParams(window.location.search);
       const preset = params.get("requestId");
