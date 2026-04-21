@@ -33,12 +33,14 @@ import {
   beginRecordedRequest,
   getRecordedRequest,
   getRecordSummary,
+  startRecording,
   setRecordedClientResponseBody,
   setRecordedClientResponseMeta,
   setRecordedRequestError,
 } from "./src/record.js";
 import type { StreamFormat } from "./src/converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse } from "./src/converters/shared.js";
+import { shouldIgnoreStreamReadError } from "./src/stream-errors.js";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -73,6 +75,7 @@ function resolveConfigPath(argv: string[]): string {
 
 const configPath = resolveConfigPath(process.argv.slice(2));
 const config = loadConfig(configPath);
+startRecording({ maxSize: config.record.max_size });
 const app = new Hono();
 
 app.use("*", async (c, next) => {
@@ -483,7 +486,17 @@ function buildStreamReadable(
         }
       } catch (error) {
         finished = true;
-        if (cancelled) return;
+        const completed = usageCollector.hasCompleted();
+        if (shouldIgnoreStreamReadError(error, { cancelled, completed })) {
+          if (completed) {
+            settleSuccess(usageCollector.getLatestUsage());
+            console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (reader released after completion)`));
+            try {
+              controller.close();
+            } catch {}
+          }
+          return;
+        }
         statusStore.recordFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
         console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
         controller.error(error);
@@ -602,7 +615,17 @@ function buildPipeStreamAndCache(
         }
       } catch (error) {
         finished = true;
-        if (cancelled) return;
+        const completed = usageCollector.hasCompleted();
+        if (shouldIgnoreStreamReadError(error, { cancelled, completed })) {
+          if (completed) {
+            settleSuccess(usageCollector.getLatestUsage());
+            console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (reader released after completion)`));
+            try {
+              controller.close();
+            } catch {}
+          }
+          return;
+        }
         statusStore.recordFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
         console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
         controller.error(error);

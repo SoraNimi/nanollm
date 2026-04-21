@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { parse as parseYAML } from "yaml";
 import type { StreamFormat } from "./converters/streams.js";
 
+export const DEFAULT_RECORD_MAX_SIZE = 10;
+
 export interface ModelConfig {
   name: string;
   provider: StreamFormat;
@@ -18,6 +20,9 @@ export interface ServerConfig {
   ttfb_timeout?: number;
   models: ModelConfig[];
   fallback: Record<string, string[]>;
+  record: {
+    max_size: number;
+  };
 }
 
 export function getPublicModelNames(config: ServerConfig): string[] {
@@ -62,6 +67,16 @@ function normalizeTimeout(value: unknown, fieldName: string): number | undefined
   return timeout;
 }
 
+function normalizePositiveInteger(value: unknown, fieldName: string): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+
+  const normalized = Number(value);
+  if (!Number.isInteger(normalized) || normalized <= 0) {
+    throw new Error(`'${fieldName}' must be a positive integer`);
+  }
+  return normalized;
+}
+
 function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): ModelConfig {
   const headers =
     model.headers && typeof model.headers === "object"
@@ -85,11 +100,13 @@ export function loadConfig(path: string): ServerConfig {
   const raw = readFileSync(path, "utf-8");
   const parsed = resolveDeep(parseYAML(raw)) as {
     server?: { port?: number; ttfb_timeout?: number };
+    record?: { max_size?: number };
     models?: ModelConfig[];
     fallback?: Record<string, string[]>;
   };
 
   const defaultTTFBTimeout = normalizeTimeout(parsed.server?.ttfb_timeout, "server.ttfb_timeout");
+  const recordMaxSize = normalizePositiveInteger(parsed.record?.max_size, "record.max_size") ?? DEFAULT_RECORD_MAX_SIZE;
   const models = (parsed.models ?? []).map((model) => normalizeModelConfig(model, defaultTTFBTimeout));
   const fallback = parsed.fallback ?? {};
   for (const m of models) {
@@ -108,6 +125,9 @@ export function loadConfig(path: string): ServerConfig {
     ...(defaultTTFBTimeout !== undefined ? { ttfb_timeout: defaultTTFBTimeout } : {}),
     models,
     fallback,
+    record: {
+      max_size: recordMaxSize,
+    },
   };
 }
 
@@ -122,7 +142,6 @@ export function resolveFallbackModels(config: ServerConfig, name: string): strin
 
 function validateFallback(models: ModelConfig[], fallback: Record<string, string[]>) {
   const knownModels = new Set(models.map((model) => model.name));
-  const assignedGroups = new Map<string, string>();
   const duplicateNames = new Set<string>();
 
   for (const model of models) {
@@ -145,11 +164,6 @@ function validateFallback(models: ModelConfig[], fallback: Record<string, string
       if (!knownModels.has(member)) {
         throw new Error(`Fallback group '${groupName}' references unknown model '${member}'`);
       }
-      const existingGroup = assignedGroups.get(member);
-      if (existingGroup && existingGroup !== groupName) {
-        throw new Error(`Model '${member}' appears in multiple fallback groups: '${existingGroup}' and '${groupName}'`);
-      }
-      assignedGroups.set(member, groupName);
     }
   }
 }

@@ -17,7 +17,7 @@ export interface RecordSummary {
   capturedCount: number;
   limit: number;
   sessionStartedAt?: number;
-  recentKeys?: Array<{ key: string; requestId: string; path: string; createdAt: number }>;
+  recentKeys?: Array<{ key: string; requestId: string; path: string; model?: string; actualModel?: string; source: "claudecode" | "codex" | "opencode" | "other"; status: "in_progress" | "success" | "failure"; createdAt: number }>;
 }
 
 const STYLE = /* css */ String.raw`
@@ -189,7 +189,8 @@ const STYLE = /* css */ String.raw`
         flex-wrap: wrap;
         gap: 8px;
       }
-      .recent-key {
+      .recent-key,
+      .recent-toggle {
         appearance: none;
         border: 1px solid rgba(140, 90, 47, 0.18);
         background: #fffaf2;
@@ -200,20 +201,93 @@ const STYLE = /* css */ String.raw`
         cursor: pointer;
         text-align: left;
       }
+      .recent-key {
+        width: 260px;
+      }
       .recent-key small {
         display: block;
         color: var(--muted);
         font-size: 11px;
         margin-top: 3px;
       }
-      .recent-more {
+      .recent-title-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: nowrap;
+      }
+      .recent-title {
+        min-width: 0;
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .recent-model-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 4px;
+      }
+      .recent-model {
+        color: var(--text);
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .source-badge {
         display: inline-flex;
         align-items: center;
         justify-content: center;
+        min-width: 28px;
+        padding: 2px 7px;
+        border-radius: 999px;
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+      }
+      .source-badge.claudecode {
+        background: rgba(140, 90, 47, 0.14);
+        color: var(--accent);
+      }
+      .source-badge.codex {
+        background: rgba(47, 92, 184, 0.14);
+        color: #2f5cb8;
+      }
+      .source-badge.opencode {
+        background: rgba(31, 31, 31, 0.14);
+        color: #1f1f1f;
+      }
+      .source-badge.other {
+        background: rgba(115, 101, 83, 0.14);
+        color: var(--muted);
+      }
+      .status-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2px 7px;
+        border-radius: 999px;
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+      }
+      .status-badge.in_progress {
+        background: rgba(47, 92, 184, 0.12);
+        color: #2f5cb8;
+      }
+      .status-badge.success {
+        background: rgba(44, 171, 99, 0.14);
+        color: #1c8d4d;
+      }
+      .status-badge.failure {
+        background: rgba(190, 74, 56, 0.14);
+        color: var(--danger);
+      }
+      .recent-toggle {
         min-width: 44px;
-        padding: 8px 10px;
-        border-radius: 10px;
-        border: 1px dashed rgba(140, 90, 47, 0.24);
+        text-align: center;
+        border-style: dashed;
         color: var(--muted);
         background: rgba(255, 250, 242, 0.7);
         font-weight: 700;
@@ -461,6 +535,102 @@ const SCRIPT = String.raw`
         });
       }
 
+      let recentExpanded = false;
+
+      function getSourceBadgeLabel(source) {
+        if (source === "claudecode") return "CC";
+        if (source === "codex") return "Codex";
+        if (source === "opencode") return "OpenCode";
+        return "Other";
+      }
+
+      function getStatusLabel(status) {
+        if (status === "success") return "成功";
+        if (status === "failure") return "失败";
+        return "请求中...";
+      }
+
+      function renderRecentButton(item) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "recent-key";
+
+        const titleRow = document.createElement("div");
+        titleRow.className = "recent-title-row";
+        const title = document.createElement("div");
+        title.className = "recent-title";
+        title.textContent = item.key;
+        titleRow.appendChild(title);
+        const sourceBadge = document.createElement("span");
+        sourceBadge.className = "source-badge " + item.source;
+        sourceBadge.textContent = getSourceBadgeLabel(item.source);
+        titleRow.appendChild(sourceBadge);
+        const statusBadge = document.createElement("span");
+        statusBadge.className = "status-badge " + item.status;
+        statusBadge.textContent = getStatusLabel(item.status);
+        titleRow.appendChild(statusBadge);
+        button.appendChild(titleRow);
+
+        const modelRow = document.createElement("div");
+        modelRow.className = "recent-model-row";
+        const model = document.createElement("span");
+        model.className = "recent-model";
+        model.textContent = item.model || "-";
+        modelRow.appendChild(model);
+        button.appendChild(modelRow);
+
+        const actualModel = document.createElement("small");
+        actualModel.textContent = "-> " + (item.actualModel || "-");
+        button.appendChild(actualModel);
+
+        const meta = document.createElement("small");
+        meta.textContent = item.path + " · " + new Date(item.createdAt).toLocaleTimeString("zh-CN");
+        button.appendChild(meta);
+
+        button.addEventListener("click", () => {
+          requestIdInput.value = item.requestId;
+          queryRecord().catch((error) => renderError(error instanceof Error ? error.message : "查询失败"));
+        });
+        return button;
+      }
+
+      function renderRecentList(summary) {
+        recentEl.textContent = "";
+        const items = summary.recentKeys || [];
+        if (items.length === 0) {
+          return;
+        }
+
+        const visibleItems = recentExpanded ? items : items.slice(0, ${RECENT_REQUEST_LIMIT});
+        visibleItems.forEach((item) => {
+          recentEl.appendChild(renderRecentButton(item));
+        });
+
+        if (!recentExpanded && items.length > ${RECENT_REQUEST_LIMIT}) {
+          const more = document.createElement("button");
+          more.type = "button";
+          more.className = "recent-toggle";
+          more.textContent = "...";
+          more.addEventListener("click", () => {
+            recentExpanded = true;
+            renderRecentList(summary);
+          });
+          recentEl.appendChild(more);
+        }
+
+        if (recentExpanded && items.length > ${RECENT_REQUEST_LIMIT}) {
+          const collapse = document.createElement("button");
+          collapse.type = "button";
+          collapse.className = "recent-toggle";
+          collapse.textContent = "<";
+          collapse.addEventListener("click", () => {
+            recentExpanded = false;
+            renderRecentList(summary);
+          });
+          recentEl.appendChild(collapse);
+        }
+      }
+
       function setSummary(summary) {
         setRequestIdOptions(summary);
         recordPanelEl.classList.toggle("recording", true);
@@ -477,33 +647,10 @@ const SCRIPT = String.raw`
           summaryEl.appendChild(pill);
         }
 
-        recentEl.textContent = "";
-        if (!summary.recentKeys || summary.recentKeys.length === 0) {
-          return;
+        if (!summary.recentKeys || summary.recentKeys.length <= ${RECENT_REQUEST_LIMIT}) {
+          recentExpanded = false;
         }
-        summary.recentKeys.slice(0, ${RECENT_REQUEST_LIMIT}).forEach((item) => {
-          const button = document.createElement("button");
-          button.type = "button";
-          button.className = "recent-key";
-          button.innerHTML =
-            item.key +
-            "<small>" +
-            item.path +
-            " · " +
-            new Date(item.createdAt).toLocaleTimeString("zh-CN") +
-            "</small>";
-          button.addEventListener("click", () => {
-            requestIdInput.value = item.requestId;
-            queryRecord().catch((error) => renderError(error instanceof Error ? error.message : "查询失败"));
-          });
-          recentEl.appendChild(button);
-        });
-        if (summary.recentKeys.length > ${RECENT_REQUEST_LIMIT}) {
-          const more = document.createElement("div");
-          more.className = "recent-more";
-          more.textContent = "...";
-          recentEl.appendChild(more);
-        }
+        renderRecentList(summary);
       }
 
       function createSection(title) {
@@ -670,52 +817,76 @@ const SCRIPT = String.raw`
 
       function parseStreamEvents(text) {
         const normalized = text.replaceAll("\r\n", "\n");
-        if (!/(^|\n)(data|event|id|retry):/.test(normalized)) {
+        if (!/^(data|event|id|retry):/m.test(normalized)) {
           return null;
         }
 
-        const blocks = normalized.split(/\n\n+/);
         const events = [];
-        for (const block of blocks) {
-          if (!block.trim()) continue;
-          const lines = block.split("\n");
-          let eventName;
-          let sawField = false;
-          const dataLines = [];
-          for (const line of lines) {
-            if (!line) continue;
-            if (line.startsWith(":")) {
-              sawField = true;
-              continue;
-            }
-            if (line.startsWith("event:")) {
-              eventName = line.slice("event:".length).trimStart();
-              sawField = true;
-              continue;
-            }
-            if (line.startsWith("data:")) {
-              dataLines.push(line.slice("data:".length).trimStart());
-              sawField = true;
-              continue;
-            }
-            if (line.startsWith("id:") || line.startsWith("retry:")) {
-              sawField = true;
-              continue;
-            }
-          }
-          if (!sawField) {
-            return null;
-          }
-          const data = dataLines.join("\n");
+        let currentEvent = undefined;
+        let currentDataLines = [];
+        let currentId = undefined;
+        let currentRetry = undefined;
+        let sawField = false;
+        let sawAnyEvent = false;
+
+        function flushEvent() {
+          if (!sawField) return;
+          const data = currentDataLines.join("\n");
           let parsed;
           if (data && data !== "[DONE]") {
             try {
               parsed = JSON.parse(data);
             } catch {}
           }
-          events.push({ event: eventName, data, parsed });
+          events.push({ event: currentEvent, data, parsed, id: currentId, retry: currentRetry });
+          currentEvent = undefined;
+          currentDataLines = [];
+          currentId = undefined;
+          currentRetry = undefined;
+          sawField = false;
+          sawAnyEvent = true;
         }
-        return events;
+
+        const lines = normalized.split("\n");
+        for (let index = 0; index < lines.length; index += 1) {
+          const line = lines[index];
+          if (line === "") {
+            flushEvent();
+            continue;
+          }
+          if (line.startsWith(":")) {
+            sawField = true;
+            continue;
+          }
+          if (line.startsWith("data:")) {
+            currentDataLines.push(line.slice(5).trimStart());
+            sawField = true;
+            continue;
+          }
+          if (line.startsWith("event:")) {
+            currentEvent = line.slice(6).trimStart();
+            sawField = true;
+            continue;
+          }
+          if (line.startsWith("id:")) {
+            currentId = line.slice(3).trimStart();
+            sawField = true;
+            continue;
+          }
+          if (line.startsWith("retry:")) {
+            currentRetry = line.slice(6).trimStart();
+            sawField = true;
+            continue;
+          }
+
+          if (!sawField || currentDataLines.length === 0) {
+            return null;
+          }
+          currentDataLines[currentDataLines.length - 1] += "\n" + line;
+        }
+
+        flushEvent();
+        return sawAnyEvent ? events : null;
       }
 
       function getStreamEventLabel(item, index) {

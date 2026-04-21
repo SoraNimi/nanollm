@@ -1,7 +1,6 @@
 import { getRequestId } from "./request-context.js";
+import { DEFAULT_RECORD_MAX_SIZE } from "./config.js";
 
-const RECORD_LIMIT = 100;
-const MAX_TEXT_CHARS = 256 * 1024;
 const REDACTED = "[REDACTED]";
 const SENSITIVE_HEADERS = new Set(["authorization", "x-api-key", "cookie", "set-cookie"]);
 
@@ -30,6 +29,9 @@ export interface RecordedAttempt {
   };
 }
 
+export type RequestSource = "claudecode" | "codex" | "opencode" | "other";
+export type RequestStatus = "in_progress" | "success" | "failure";
+
 export interface RecordEntry {
   requestId: string;
   key: string;
@@ -39,6 +41,10 @@ export interface RecordEntry {
     path: string;
     headers: Record<string, string>;
     body: unknown;
+    model?: string;
+    actualModel?: string;
+    source: RequestSource;
+    status: RequestStatus;
   };
   attempts: RecordedAttempt[];
   clientResponse: {
@@ -58,7 +64,32 @@ export interface RecordSummary {
   limit: number;
   sessionStartedAt?: number;
   size: number;
-  recentKeys: Array<{ key: string; requestId: string; path: string; createdAt: number }>;
+  recentKeys: Array<{ key: string; requestId: string; path: string; model?: string; actualModel?: string; source: RequestSource; status: RequestStatus; createdAt: number }>;
+}
+
+function extractRequestModel(body: unknown): string | undefined {
+  if (!body || typeof body !== "object") return undefined;
+  const model = (body as Record<string, unknown>).model;
+  return typeof model === "string" && model ? model : undefined;
+}
+
+function classifyRequestSource(headers: Headers | Record<string, string> | undefined): RequestSource {
+  if (!headers) return "other";
+  const userAgent = typeof (headers as Headers).get === "function"
+    ? (headers as Headers).get("user-agent")
+    : Object.entries(headers).find(([key]) => key.toLowerCase() === "user-agent")?.[1];
+  const normalized = userAgent?.toLowerCase() ?? "";
+  if (normalized.includes("claude-cli")) return "claudecode";
+  if (normalized.includes("codex")) return "codex";
+  if (normalized.includes("opencode")) return "opencode";
+  return "other";
+}
+
+function buildRequestMeta(headers: Headers | Record<string, string> | undefined, body: unknown) {
+  return {
+    model: extractRequestModel(body),
+    source: classifyRequestSource(headers),
+  };
 }
 
 function cloneJson<T>(value: T): T {
@@ -78,21 +109,12 @@ function normalizeHeaders(headers: Headers | Record<string, string> | undefined)
   return Object.fromEntries(entries.map(([key, value]) => [key, maskHeaderValue(key, value)]));
 }
 
-function truncateText(text: string): { value: string; truncated: boolean } {
-  if (text.length <= MAX_TEXT_CHARS) return { value: text, truncated: false };
-  return {
-    value: `${text.slice(0, MAX_TEXT_CHARS)}\n...[truncated]`,
-    truncated: true,
-  };
-}
-
 function normalizeBody(body: unknown): { value: unknown; truncated: boolean } {
   if (typeof body === "string") {
     try {
       return { value: cloneJson(JSON.parse(body)), truncated: false };
     } catch {
-      const text = truncateText(body);
-      return { value: text.value, truncated: text.truncated };
+      return { value: body, truncated: false };
     }
   }
 
@@ -101,7 +123,7 @@ function normalizeBody(body: unknown): { value: unknown; truncated: boolean } {
 
 function appendTextBody(current: unknown, chunk: string): { value: string; truncated: boolean } {
   const base = typeof current === "string" ? current : "";
-  return truncateText(base + chunk);
+  return { value: base + chunk, truncated: false };
 }
 
 function getRecordKey(requestId: string): string {
@@ -123,7 +145,7 @@ function resolveRequestId(requestId?: string): string | undefined {
 class RecordStore {
   enabled = true;
   capturedCount = 0;
-  readonly limit = RECORD_LIMIT;
+  limit = DEFAULT_RECORD_MAX_SIZE;
   sessionStartedAt?: number;
   private readonly records = new Map<string, RecordEntry>();
 
@@ -136,7 +158,8 @@ class RecordStore {
     }
   }
 
-  start() {
+  start(options?: { maxSize?: number }) {
+    this.limit = options?.maxSize ?? DEFAULT_RECORD_MAX_SIZE;
     this.enabled = true;
     this.capturedCount = 0;
     if (!this.sessionStartedAt) this.sessionStartedAt = Date.now();
@@ -157,11 +180,14 @@ class RecordStore {
       size: this.records.size,
       recentKeys: Array.from(this.records.values())
         .sort((a, b) => b.createdAt - a.createdAt)
-        .slice(0, 12)
         .map((record) => ({
           key: record.key,
           requestId: record.requestId,
           path: record.clientRequest.path,
+          model: record.clientRequest.model,
+          actualModel: record.clientRequest.actualModel,
+          source: record.clientRequest.source,
+          status: record.clientRequest.status,
           createdAt: record.createdAt,
         })),
     };
@@ -178,6 +204,7 @@ class RecordStore {
     const key = getRecordKey(input.requestId);
     if (this.records.has(key)) return true;
     this.evictOldestIfNeeded();
+    const requestMeta = buildRequestMeta(input.headers, input.body);
     this.records.set(key, {
       requestId: input.requestId,
       key,
@@ -187,6 +214,10 @@ class RecordStore {
         path: input.path,
         headers: normalizeHeaders(input.headers) ?? {},
         body: cloneJson(input.body),
+        model: requestMeta.model,
+        actualModel: undefined,
+        source: requestMeta.source,
+        status: "in_progress",
       },
       attempts: [],
       clientResponse: {},
@@ -232,6 +263,7 @@ class RecordStore {
       },
       response: {},
     };
+    record.clientRequest.actualModel = input.modelName;
     record.attempts.push(attempt);
     return attempt;
   }
@@ -293,6 +325,7 @@ class RecordStore {
     const body = normalizeBody(input.body);
     record.clientResponse.body = body.value;
     record.clientResponse.truncated = body.truncated;
+    record.clientRequest.status = "success";
   }
 
   appendClientResponseBody(input: { requestId?: string; chunk: string }) {
@@ -301,19 +334,21 @@ class RecordStore {
     const text = appendTextBody(record.clientResponse.body, input.chunk);
     record.clientResponse.body = text.value;
     record.clientResponse.truncated = text.truncated;
+    record.clientRequest.status = "success";
   }
 
   setRequestError(input: { requestId?: string; message: string }) {
     const record = this.getMutable(input.requestId);
     if (!record) return;
     record.error = { message: input.message };
+    record.clientRequest.status = "failure";
   }
 }
 
 const recordStore = new RecordStore();
 
-export function startRecording() {
-  recordStore.start();
+export function startRecording(options?: { maxSize?: number }) {
+  recordStore.start(options);
   return recordStore.summary();
 }
 

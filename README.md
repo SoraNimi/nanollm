@@ -16,6 +16,9 @@ server:
   port: 3000 # default 3000
   ttfb_timeout: 5000 # optional, upstream first-byte timeout in ms
 
+record:
+  max_size: 100 # optional, default 10
+
 models:
   - name: gpt-5.4-a
     # responses规范
@@ -85,6 +88,6 @@ npx nanollm
 
 提供了`http://localhost:3000/status`的监控页面，可以查看模型健康状态。
 
-提供了`http://localhost:3000/record`的采样记录页面，可以查看请求记录，对debug非常有用（只保留最新100次请求）。
+提供了`http://localhost:3000/record`的采样记录页面，可以查看请求记录，对debug非常有用（默认只保留最新10次请求，可通过`record.max_size`配置修改）。
 
 上述数据都只存在内存中，进程结束即消失，作为一个超轻量工具，没有任何持久化存储。

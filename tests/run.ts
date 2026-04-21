@@ -35,11 +35,13 @@ import {
   setRecordedAttemptResponseMeta,
   setRecordedClientResponseBody,
   setRecordedClientResponseMeta,
+  setRecordedRequestError,
   startRecording,
   stopRecording,
 } from "../src/record.js";
 import { runWithRequestId } from "../src/request-context.js";
 import { StatusStore, getHealthTone } from "../src/status.js";
+import { shouldIgnoreStreamReadError } from "../src/stream-errors.js";
 
 function run(name: string, fn: () => void) {
   try {
@@ -1543,6 +1545,28 @@ models:
     assert.equal(config.ttfb_timeout, 1500);
     assert.equal(config.models[0].ttfb_timeout, 1500);
     assert.equal(config.models[1].ttfb_timeout, 2500);
+    assert.equal(config.record.max_size, 10);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+run("config allows overriding record max_size", () => {
+  const configPath = writeTempConfig(`
+record:
+  max_size: 100
+
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+`);
+
+  try {
+    const config = loadConfig(configPath);
+    assert.equal(config.record.max_size, 100);
   } finally {
     rmSync(dirname(configPath), { recursive: true, force: true });
   }
@@ -1572,6 +1596,42 @@ fallback:
     assert.deepEqual(getPublicModelNames(config), ["group-a", "alpha", "beta"]);
     assert.deepEqual(resolveFallbackModels(config, "group-a"), ["alpha", "beta"]);
     assert.deepEqual(resolveFallbackModels(config, "alpha"), ["alpha"]);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+run("config allows the same model in multiple fallback groups", () => {
+  const configPath = writeTempConfig(`
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+  - name: beta
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-beta
+  - name: gamma
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-gamma
+fallback:
+  group-a:
+    - alpha
+    - beta
+  group-b:
+    - beta
+    - gamma
+`);
+
+  try {
+    const config = loadConfig(configPath);
+    assert.deepEqual(resolveFallbackModels(config, "group-a"), ["alpha", "beta"]);
+    assert.deepEqual(resolveFallbackModels(config, "group-b"), ["beta", "gamma"]);
   } finally {
     rmSync(dirname(configPath), { recursive: true, force: true });
   }
@@ -1635,6 +1695,26 @@ models:
     rmSync(dirname(configPath), { recursive: true, force: true });
   }
 }, "'server.ttfb_timeout' must be a positive number");
+
+runThrows("config rejects invalid record.max_size values", () => {
+  const configPath = writeTempConfig(`
+record:
+  max_size: 0
+
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+`);
+
+  try {
+    loadConfig(configPath);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+}, "'record.max_size' must be a positive integer");
 
 await runAsync("upstream request fails when first byte exceeds ttfb_timeout", async () => {
   await withHTTPServer(async (_req, res) => {
@@ -1751,7 +1831,7 @@ run("record store resets on start and supports full request id lookup", () => {
     beginRecordedRequest({
       requestId,
       path: "/v1/chat/completions",
-      headers: { Authorization: "Bearer top-secret", "X-Test": "ok" },
+      headers: { Authorization: "Bearer top-secret", "X-Test": "ok", "User-Agent": "claude-cli/1.0" },
       body: { model: "alpha", messages: [{ role: "user", content: "hello" }] },
       stream: false,
     }),
@@ -1793,21 +1873,73 @@ run("record store resets on start and supports full request id lookup", () => {
   assert.equal(getRecordedRequest("requestId=abcdef")?.requestId, requestId);
   assert.equal(record?.clientRequest.headers.Authorization, "[REDACTED]");
   assert.equal(record?.attempts[0].request.headers?.Authorization, "[REDACTED]");
+  assert.equal(record?.clientRequest.model, "alpha");
+  assert.equal(record?.clientRequest.actualModel, "alpha");
+  assert.equal(record?.clientRequest.source, "claudecode");
+  assert.equal(record?.clientRequest.status, "success");
   assert.deepEqual(record?.attempts[0].request.body, { model: "upstream-alpha", stream: false });
   assert.deepEqual(record?.attempts[0].response.body, { id: "chatcmpl_1", choices: [] });
 
-  startRecording();
-  assert.equal(getRecordedRequest(requestId), undefined);
-  assert.equal(getRecordSummary().capturedCount, 0);
+  const summary = getRecordSummary();
+  assert.equal(summary.recentKeys[0]?.model, "alpha");
+  assert.equal(summary.recentKeys[0]?.actualModel, "alpha");
+  assert.equal(summary.recentKeys[0]?.source, "claudecode");
+  assert.equal(summary.recentKeys[0]?.status, "success");
+
   stopRecording();
-  assert.equal(getRecordSummary().sessionStartedAt, undefined);
 });
 
-run("record store only captures the first 100 requests", () => {
+run("record summary keeps fallback actual model and failure status", () => {
   startRecording();
-  for (let index = 0; index < 101; index += 1) {
+  const requestId = "fedcba98-7654-3210-abcd-ef1234567890";
+  beginRecordedRequest({
+    requestId,
+    path: "/v1/responses",
+    headers: { "User-Agent": "codex/1.0" },
+    body: { model: "group-model", input: "hello" },
+    stream: false,
+  });
+  ensureRecordedAttempt({
+    requestId,
+    index: 1,
+    provider: "openai-responses",
+    modelName: "fallback-alpha",
+    url: "https://example.com/v1/responses",
+    requestHeaders: {},
+    requestBody: JSON.stringify({ model: "fallback-alpha", stream: false }),
+  });
+  setRecordedRequestError({ requestId, message: "boom" });
+
+  const summary = getRecordSummary();
+  assert.equal(summary.recentKeys[0]?.model, "group-model");
+  assert.equal(summary.recentKeys[0]?.actualModel, "fallback-alpha");
+  assert.equal(summary.recentKeys[0]?.source, "codex");
+  assert.equal(summary.recentKeys[0]?.status, "failure");
+  stopRecording();
+});
+
+run("record store only captures the first 10 requests by default", () => {
+  startRecording();
+  for (let index = 0; index < 11; index += 1) {
     beginRecordedRequest({
       requestId: `${String(index).padStart(6, "0")}-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`,
+      path: "/v1/chat/completions",
+      headers: {},
+      body: { model: "alpha" },
+      stream: false,
+    });
+  }
+  assert.equal(getRecordSummary().capturedCount, 10);
+  assert.equal(getRecordSummary().size, 10);
+  assert.equal(getRecordedRequest("000000"), undefined);
+  stopRecording();
+});
+
+run("record store allows overriding max size when starting", () => {
+  startRecording({ maxSize: 100 });
+  for (let index = 0; index < 101; index += 1) {
+    beginRecordedRequest({
+      requestId: `${String(index).padStart(6, "0")}-ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee`,
       path: "/v1/chat/completions",
       headers: {},
       body: { model: "alpha" },
@@ -1826,7 +1958,7 @@ run("record page renders query UI and JSON tree viewer", () => {
     capturedCount: 3,
     limit: 100,
     sessionStartedAt: Date.UTC(2026, 3, 20, 10, 0, 0),
-    recentKeys: [{ key: "abcdef", requestId: "abcdef12-3456", path: "/v1/chat/completions", createdAt: Date.UTC(2026, 3, 20, 10, 0, 1) }],
+    recentKeys: [{ key: "abcdef", requestId: "abcdef12-3456", path: "/v1/chat/completions", model: "claude-sonnet-4-6", actualModel: "claude-sonnet-4-6-lite", source: "claudecode", status: "success", createdAt: Date.UTC(2026, 3, 20, 10, 0, 1) }],
   });
   assert.match(html, /Request Record/);
   assert.match(html, /fetch\("\/record\/summary"/);
@@ -1850,10 +1982,61 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /placeholder="例如 6dfae2"/);
   assert.match(html, /grid-template-columns: 1fr/);
   assert.match(html, /recent-key/);
-  assert.match(html, /recent-more/);
-  assert.match(html, /slice\(0, 10\)/);
+  assert.match(html, /recent-toggle/);
+  assert.match(html, /recent-title-row/);
+  assert.match(html, /recent-title/);
+  assert.match(html, /recent-model-row/);
+  assert.match(html, /recent-model/);
+  assert.match(html, /source-badge/);
+  assert.match(html, /source-badge\.claudecode/);
+  assert.match(html, /source-badge\.codex/);
+  assert.match(html, /source-badge\.opencode/);
+  assert.match(html, /source-badge\.other/);
+  assert.match(html, /status-badge/);
+  assert.match(html, /width: 260px/);
+  assert.match(html, /color: #2f5cb8/);
+  assert.match(html, /color: #1f1f1f/);
+  assert.match(html, /getSourceBadgeLabel/);
+  assert.match(html, /getStatusLabel/);
+  assert.match(html, /return "CC"/);
+  assert.match(html, /return "Codex"/);
+  assert.match(html, /return "OpenCode"/);
+  assert.match(html, /return "Other"/);
+  assert.match(html, /return "成功"/);
+  assert.match(html, /return "失败"/);
+  assert.match(html, /return "请求中\.\.\."/);
+  assert.match(html, /titleRow\.className = "recent-title-row"/);
+  assert.match(html, /title\.className = "recent-title"/);
+  assert.match(html, /sourceBadge\.className = "source-badge " \+ item\.source/);
+  assert.match(html, /statusBadge\.className = "status-badge " \+ item\.status/);
+  assert.match(html, /actualModel\.textContent = "-> " \+ \(item\.actualModel \|\| "-"\)/);
+  assert.match(html, /meta\.textContent = item\.path \+ " · " \+ new Date\(item\.createdAt\)\.toLocaleTimeString\("zh-CN"\)/);
+  assert.match(html, /renderRecentList/);
+  assert.match(html, /items\.slice\(0, 10\)/);
+  assert.match(html, /model\.textContent = item\.model \|\| "-"/);
+  assert.match(html, /more\.textContent = "\.\.\."/);
+  assert.match(html, /collapse\.textContent = "<"/);
+  assert.match(html, /function flushEvent\(/);
+  assert.match(html, /const lines = normalized\.split\("\\n"\)/);
+  assert.match(html, /currentDataLines\[currentDataLines\.length - 1\] \+= "\\n" \+ line/);
+  assert.doesNotMatch(html, /const blocks = normalized\.split\(/);
   assert.doesNotMatch(html, /开始采样/);
   assert.doesNotMatch(html, /停止采样/);
+});
+
+run("record page stream parser keeps data-like text inside JSON payloads", () => {
+  const html = renderRecordPage({
+    enabled: true,
+    capturedCount: 1,
+    limit: 100,
+    sessionStartedAt: Date.UTC(2026, 3, 20, 10, 0, 0),
+    recentKeys: [],
+  });
+  assert.match(html, /let currentDataLines = \[\]/);
+  assert.match(html, /for \(let index = 0; index < lines\.length; index \+= 1\)/);
+  assert.match(html, /if \(line === ""\) \{\n            flushEvent\(\);/);
+  assert.match(html, /currentDataLines\.push\(line\.slice\(5\)\.trimStart\(\)\)/);
+  assert.match(html, /currentDataLines\[currentDataLines\.length - 1\] \+= "\\n" \+ line/);
 });
 
 run("http log level only keeps /v1 lifecycle logs at info", () => {
@@ -1878,6 +2061,17 @@ run("debug logs are hidden by default and can be enabled with LOG_LEVEL=debug", 
   } else {
     process.env.LOG_LEVEL = original;
   }
+});
+
+run("reader release errors are ignored only for cancelled or completed streams", () => {
+  const releasedReaderError = Object.assign(new TypeError("Invalid state: Releasing reader"), {
+    code: "ERR_INVALID_STATE",
+  });
+
+  assert.equal(shouldIgnoreStreamReadError(releasedReaderError, { cancelled: false, completed: true }), true);
+  assert.equal(shouldIgnoreStreamReadError(releasedReaderError, { cancelled: true, completed: false }), true);
+  assert.equal(shouldIgnoreStreamReadError(releasedReaderError, { cancelled: false, completed: false }), false);
+  assert.equal(shouldIgnoreStreamReadError(new Error("socket hang up"), { cancelled: false, completed: true }), false);
 });
 
 await runAsync("passthrough request records upstream request and response", async () => {
@@ -1961,5 +2155,41 @@ run("record helpers append streaming provider and client chunks as text", () => 
   const record = getRecordedRequest(requestId);
   assert.equal(record?.attempts[0].response.body, "data: raw-1\n\ndata: raw-2\n\n");
   assert.equal(record?.clientResponse.body, "data: out-1\n\ndata: out-2\n\n");
+  assert.equal(record?.attempts[0].response.truncated, false);
+  assert.equal(record?.clientResponse.truncated, false);
+  stopRecording();
+});
+
+run("record store keeps long text bodies without appending truncated marker", () => {
+  startRecording();
+  const requestId = "76543210-1234-5678-9abc-def012345678";
+  beginRecordedRequest({
+    requestId,
+    path: "/v1/responses",
+    headers: {},
+    body: { model: "alpha", stream: true },
+    stream: true,
+  });
+  ensureRecordedAttempt({
+    requestId,
+    index: 1,
+    provider: "openai-responses",
+    modelName: "alpha",
+    url: "https://example.com/v1/responses",
+    requestHeaders: {},
+    requestBody: JSON.stringify({ model: "upstream-alpha", stream: true }),
+  });
+
+  const longChunk = "x".repeat(300000);
+  appendRecordedAttemptResponseBody({ requestId, index: 1, chunk: longChunk });
+  appendRecordedClientResponseBody({ requestId, chunk: longChunk });
+
+  const record = getRecordedRequest(requestId);
+  assert.equal((record?.attempts[0].response.body as string).length, longChunk.length);
+  assert.equal((record?.clientResponse.body as string).length, longChunk.length);
+  assert.doesNotMatch(record?.attempts[0].response.body as string, /\.\.\.\[truncated\]$/);
+  assert.doesNotMatch(record?.clientResponse.body as string, /\.\.\.\[truncated\]$/);
+  assert.equal(record?.attempts[0].response.truncated, false);
+  assert.equal(record?.clientResponse.truncated, false);
   stopRecording();
 });
