@@ -976,6 +976,24 @@ const SCRIPT = /* js */ String.raw`
         return payload;
       }
 
+      function isHistoryRestore(event) {
+        if (event && event.persisted) return true;
+        if (typeof performance.getEntriesByType === "function") {
+          const navigationEntry = performance.getEntriesByType("navigation")[0];
+          if (navigationEntry && navigationEntry.type === "back_forward") {
+            return true;
+          }
+        }
+        return Boolean(performance.navigation && performance.navigation.type === 2);
+      }
+
+      function syncAfterHistoryRestore(event) {
+        if (saving || dirty || !isHistoryRestore(event)) return;
+        refreshFromServer().catch((error) => {
+          setStatus("error", error instanceof Error ? error.message : "刷新失败");
+        });
+      }
+
       async function saveConfig() {
         setSaving(true);
         setStatus("warn", "正在保存并应用配置...");
@@ -1068,6 +1086,10 @@ const SCRIPT = /* js */ String.raw`
         markDirty(false);
         renderAll();
         setStatus("", "已恢复到当前服务端配置。");
+      });
+
+      window.addEventListener("pageshow", (event) => {
+        syncAfterHistoryRestore(event);
       });
 
       renderAll();

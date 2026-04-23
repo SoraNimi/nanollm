@@ -20,6 +20,7 @@ import {
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
 import { getPublicModelNames, loadConfig, resolveFallbackModels } from "../src/config.js";
+import { renderAdminConfigPage } from "../src/admin-config-page.js";
 import { ConfigManager } from "../src/config-manager.js";
 import { sortFallbackGroupMembers } from "../src/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
@@ -2490,4 +2491,30 @@ run("record store keeps long text bodies without appending truncated marker", ()
   assert.equal(record?.attempts[0].response.truncated, false);
   assert.equal(record?.clientResponse.truncated, false);
   stopRecording();
+});
+
+run("admin page refreshes clean state after history restore", () => {
+  const html = renderAdminConfigPage({
+    version: 3,
+    configPath: "config.yaml",
+    effectiveConfig: {
+      port: 4444,
+      models: [],
+      fallback: {},
+      record: { max_size: 10 },
+    },
+    requiresRestartFields: [],
+    form: {
+      server: { port: "4444", ttfb_timeout: "" },
+      record: { max_size: "10" },
+      models: [],
+      fallbackGroups: [],
+    },
+  });
+
+  assert.match(html, /function isHistoryRestore\(event\)/);
+  assert.match(html, /navigationEntry && navigationEntry\.type === "back_forward"/);
+  assert.match(html, /if \(saving \|\| dirty \|\| !isHistoryRestore\(event\)\) return;/);
+  assert.match(html, /window\.addEventListener\("pageshow", \(event\) => \{/);
+  assert.match(html, /refreshFromServer\(\)\.catch\(\(error\) => \{/);
 });
